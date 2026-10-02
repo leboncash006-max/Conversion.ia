@@ -124,7 +124,7 @@ class Contact {
   static Contact fromJson(Map<String, dynamic> j) => Contact(
         id: j['id'] as String,
         name: j['name'] as String,
-        age: (j['age'] as num?)?.toInt() ?? 18,
+        age: (j['age'] as num?)?.toInt() ?? 10,
         description: j['description'] as String? ?? '',
         color: (j['color'] as num?)?.toInt() ?? 0xFF128C7E,
         messages: [
