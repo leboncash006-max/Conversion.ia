@@ -779,7 +779,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
     final c = widget.contact;
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
-    _age = (c?.age ?? 20).clamp(18, 60).toDouble();
+    _age = (c?.age ?? 12).clamp(10, 60).toDouble();
     _color = c?.color ?? _palette[widget.brain.contacts.length % _palette.length];
   }
 
