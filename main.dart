@@ -458,29 +458,30 @@ class Brain extends ChangeNotifier {
   // ----- Conversation -----
   String systemPrompt(Contact c) {
     final desc = c.description.trim();
-    final buf = StringBuffer()
-      ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
-          '(style WhatsApp) avec ton ami(e).')
-      ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
-      ..writeln('Tu écris en français, de façon naturelle et spontanée. '
-          'Messages courts (1 à 3 phrases), parfois un emoji. '
-          'Pas de narration, pas d\'astérisques, pas de didascalies.')
-      ..writeln('Tu restes toujours dans ton personnage et tu relances '
-          'de temps en temps la conversation avec une question.');
-    // Mémoire : on rejoue les derniers messages dans le contexte.
-    final hist = c.messages.length > 14
-        ? c.messages.sublist(c.messages.length - 14)
-        : c.messages;
-    if (hist.isNotEmpty) {
-      buf.writeln('\nDébut de votre conversation (pour mémoire) :');
-      for (final m in hist) {
-        buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : ${m.text}');
-      }
-      buf.writeln('Continue naturellement à partir de là.');
+      final desc = c.description.trim();
+  final buf = StringBuffer()
+    ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
+        '(style WhatsApp) avec ton ami(e).')
+    ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
+    ..writeln('Tu écris en français, de façon naturelle et spontanée. '
+        'Messages courts (1 à 3 phrases), parfois un emoji. '
+        'Pas de narration, pas d\'astérisques, pas de didascalies.')
+    ..writeln('Tu restes toujours dans ton personnage et tu relances '
+        'de temps en temps la conversation avec une question.');
+  // Mémoire : on rejoue les derniers messages dans le contexte.
+  final hist = c.messages.length > 14
+      ? c.messages.sublist(c.messages.length - 14)
+      : c.messages;
+  if (hist.isNotEmpty) {
+    buf.writeln('\nDébut de votre conversation (pour mémoire) :');
+    for (final m in hist) {
+      buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : ${m.text}');
     }
-    return buf.toString();
+    buf.writeln('Continue naturellement à partir de là.');
   }
-
+  return buf.toString();
+  }
+  
   Future<LiteLmConversation> _convFor(Contact c) async {
     final existing = _convs[c.id];
     if (existing != null) return existing;
