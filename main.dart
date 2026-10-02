@@ -44,6 +44,20 @@ class MessengerApp extends StatelessWidget {
             foregroundColor: Colors.white,
           ),
         ),
+        darkTheme: ThemeData(
+          useMaterial3: true,
+          brightness: Brightness.dark,
+          colorSchemeSeed: _waGreen,
+          appBarTheme: const AppBarTheme(
+            backgroundColor: _waGreen,
+            foregroundColor: Colors.white,
+          ),
+          floatingActionButtonTheme: const FloatingActionButtonThemeData(
+            backgroundColor: _waLight,
+            foregroundColor: Colors.white,
+          ),
+        ),
+        themeMode: ThemeMode.system,
         home: const Bootstrap(),
       );
 }
@@ -365,12 +379,26 @@ class Brain extends ChangeNotifier {
     IOSink? sink;
     try {
       final url = await _resolveUrl(m);
+      var offset = await part.exists() ? await part.length() : 0;
       final req = await client.getUrl(Uri.parse(url));
+      if (offset > 0) {
+        req.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
+        status = 'Reprise du téléchargement…';
+        notifyListeners();
+      }
       final res = await req.close();
-      if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
-      final total = res.contentLength > 0 ? res.contentLength : m.sizeBytes;
-      sink = part.openWrite();
-      var received = 0;
+      if (res.statusCode == 416) {
+        if (await part.exists()) await part.delete();
+        throw Exception('fichier partiel invalide, relance le téléchargement');
+      }
+      if (res.statusCode != 200 && res.statusCode != 206) {
+        throw Exception('HTTP ${res.statusCode}');
+      }
+      if (res.statusCode == 200) offset = 0;
+      final total =
+          res.contentLength > 0 ? offset + res.contentLength : m.sizeBytes;
+      sink = part.openWrite(mode: offset > 0 ? FileMode.append : FileMode.write);
+      var received = offset;
       var lastPct = -1;
       await for (final chunk in res) {
         sink.add(chunk);
@@ -393,9 +421,9 @@ class Brain extends ChangeNotifier {
     } catch (e) {
       try {
         await sink?.close();
-        if (await part.exists()) await part.delete();
       } catch (_) {}
-      status = 'Erreur de téléchargement : $e';
+      status = 'Erreur de téléchargement : $e '
+          '(le fichier partiel est gardé : relance pour reprendre)';
     } finally {
       client.close();
       progress = null;
@@ -458,7 +486,6 @@ class Brain extends ChangeNotifier {
   // ----- Conversation -----
   String systemPrompt(Contact c) {
     final desc = c.description.trim();
-      final desc = c.description.trim();
   final buf = StringBuffer()
     ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
         '(style WhatsApp) avec ton ami(e).')
@@ -536,6 +563,63 @@ class Brain extends ChangeNotifier {
     }
   }
 
+  // ----- Confort de chat -----
+  Future<void> regenerate(Contact c) async {
+    if (generating.contains(c.id) || !ready) return;
+    while (c.messages.isNotEmpty && !c.messages.last.fromMe) {
+      c.messages.removeLast();
+    }
+    if (c.messages.isEmpty) return;
+    final last = c.messages.removeLast();
+    _dropConv(c.id);
+    await send(c, last.text);
+  }
+
+  void deleteMessage(Contact c, Msg m) {
+    if (generating.contains(c.id)) return;
+    c.messages.remove(m);
+    _dropConv(c.id);
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  Future<void> editAndResend(Contact c, Msg m, String text) async {
+    if (generating.contains(c.id) || !ready) return;
+    final i = c.messages.indexOf(m);
+    if (i < 0) return;
+    c.messages.removeRange(i, c.messages.length);
+    _dropConv(c.id);
+    await send(c, text);
+  }
+
+  String exportText(Contact c) {
+    final b = StringBuffer('Discussion avec ${c.name}\n\n');
+    for (final m in c.messages) {
+      final t = m.time;
+      b.writeln('[${t.day.toString().padLeft(2, '0')}/'
+          '${t.month.toString().padLeft(2, '0')} ${_hhmm(t)}] '
+          '${m.fromMe ? 'Moi' : c.name} : ${m.text}');
+    }
+    return b.toString();
+  }
+
+  // Chargement automatique au lancement. Un fichier témoin évite une boucle
+  // de plantage si le modèle est trop lourd pour le téléphone.
+  Future<void> autoLoad() async {
+    if (!downloaded.contains(modelId)) return;
+    final flag = File('${_dir.path}/loading.flag');
+    if (await flag.exists()) {
+      await flag.delete();
+      status = 'Le dernier chargement automatique a échoué : '
+          'charge le modèle à la main (ou choisis un modèle plus léger).';
+      notifyListeners();
+      return;
+    }
+    await flag.writeAsString('1');
+    await load();
+    if (await flag.exists()) await flag.delete();
+  }
+
   void _addReply(Contact c, String? raw, Stopwatch sw) {
     final clean = _clean(raw ?? '');
     c.messages.add(Msg(
@@ -572,6 +656,7 @@ class _BootstrapState extends State<Bootstrap> {
     super.initState();
     brain.init().then((_) {
       if (mounted) setState(() => _ready = true);
+      unawaited(brain.autoLoad());
     });
   }
 
@@ -612,9 +697,18 @@ class Avatar extends StatelessWidget {
       );
 }
 
-class ChatsPage extends StatelessWidget {
+class ChatsPage extends StatefulWidget {
   const ChatsPage({super.key, required this.brain});
   final Brain brain;
+
+  @override
+  State<ChatsPage> createState() => _ChatsPageState();
+}
+
+class _ChatsPageState extends State<ChatsPage> {
+  Brain get brain => widget.brain;
+  bool _searching = false;
+  String _query = '';
 
   @override
   Widget build(BuildContext context) {
@@ -630,11 +724,35 @@ class ChatsPage extends StatelessWidget {
                 : b.messages.last.time;
             return tb.compareTo(ta);
           });
+        final q = _query.trim().toLowerCase();
+        final shown = q.isEmpty
+            ? list
+            : list.where((c) => c.name.toLowerCase().contains(q)).toList();
         return Scaffold(
           appBar: AppBar(
-            title: const Text('IA Messenger',
-                style: TextStyle(fontWeight: FontWeight.bold)),
+            title: _searching
+                ? TextField(
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white),
+                    cursorColor: Colors.white,
+                    decoration: const InputDecoration(
+                      hintText: 'Rechercher un contact',
+                      hintStyle: TextStyle(color: Colors.white70),
+                      border: InputBorder.none,
+                    ),
+                    onChanged: (v) => setState(() => _query = v),
+                  )
+                : const Text('IA Messenger',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
             actions: [
+              IconButton(
+                tooltip: _searching ? 'Fermer la recherche' : 'Rechercher',
+                icon: Icon(_searching ? Icons.close : Icons.search),
+                onPressed: () => setState(() {
+                  _searching = !_searching;
+                  _query = '';
+                }),
+              ),
               IconButton(
                 tooltip: 'Modèles IA',
                 icon: Icon(brain.ready ? Icons.memory : Icons.memory_outlined,
@@ -664,14 +782,42 @@ class ChatsPage extends StatelessWidget {
                 ),
               Expanded(
                 child: ListView.separated(
-                  itemCount: list.length,
+                  itemCount: shown.length,
                   separatorBuilder: (_, __) =>
                       const Divider(height: 1, indent: 76),
                   itemBuilder: (context, i) {
-                    final c = list[i];
+                    final c = shown[i];
                     final last = c.messages.isEmpty ? null : c.messages.last;
                     final typing = brain.generating.contains(c.id);
-                    return ListTile(
+                    return Dismissible(
+                      key: ValueKey(c.id),
+                      direction: DismissDirection.endToStart,
+                      background: Container(
+                        color: Colors.red,
+                        alignment: Alignment.centerRight,
+                        padding: const EdgeInsets.only(right: 24),
+                        child: const Icon(Icons.delete, color: Colors.white),
+                      ),
+                      confirmDismiss: (_) async =>
+                          await showDialog<bool>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: Text('Supprimer ${c.name} ?'),
+                              content: const Text(
+                                  'Le contact et sa discussion seront effacés.'),
+                              actions: [
+                                TextButton(
+                                    onPressed: () => Navigator.pop(ctx, false),
+                                    child: const Text('Annuler')),
+                                TextButton(
+                                    onPressed: () => Navigator.pop(ctx, true),
+                                    child: const Text('Supprimer')),
+                              ],
+                            ),
+                          ) ??
+                          false,
+                      onDismissed: (_) => brain.deleteContact(c),
+                      child: ListTile(
                       leading: Avatar(c),
                       title: Text(c.name,
                           style: const TextStyle(fontWeight: FontWeight.w600)),
@@ -691,15 +837,16 @@ class ChatsPage extends StatelessWidget {
                       trailing: last == null
                           ? null
                           : Text(_dayLabel(last.time),
-                              style: const TextStyle(
-                                  fontSize: 12, color: Colors.black54)),
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  color: Theme.of(context).hintColor)),
                       onTap: () => Navigator.push(
                           context,
                           MaterialPageRoute(
                               builder: (_) =>
                                   ChatPage(brain: brain, contact: c))),
                       onLongPress: () => _contactMenu(context, c),
-                    );
+                    ));
                   },
                 ),
               ),
@@ -978,6 +1125,11 @@ class _ChatPageState extends State<ChatPage> {
                                 ContactEditPage(brain: brain, contact: c)));
                   } else if (v == 'clear') {
                     brain.clearChat(c);
+                  } else if (v == 'export') {
+                    Clipboard.setData(
+                        ClipboardData(text: brain.exportText(c)));
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        content: Text('Discussion copiée dans le presse-papiers')));
                   } else if (v == 'models') {
                     Navigator.push(
                         context,
@@ -988,25 +1140,43 @@ class _ChatPageState extends State<ChatPage> {
                 itemBuilder: (_) => const [
                   PopupMenuItem(value: 'edit', child: Text('Modifier le contact')),
                   PopupMenuItem(value: 'models', child: Text('Modèles IA')),
+                  PopupMenuItem(value: 'export', child: Text('Exporter (copier)')),
                   PopupMenuItem(value: 'clear', child: Text('Vider la discussion')),
                 ],
               ),
             ],
           ),
           body: Container(
-            color: _chatBg,
+            color: _dark(context) ? const Color(0xFF0B141A) : _chatBg,
             child: Column(
               children: [
                 Expanded(
-                  child: ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(10),
-                    itemCount: count,
-                    itemBuilder: (context, i) {
-                      if (i == c.messages.length) return _typingBubble();
-                      return _bubble(c.messages[i]);
-                    },
-                  ),
+                  child: Builder(builder: (context) {
+                    final items = <Object>[];
+                    DateTime? prev;
+                    for (final m in c.messages) {
+                      if (prev == null ||
+                          prev.year != m.time.year ||
+                          prev.month != m.time.month ||
+                          prev.day != m.time.day) {
+                        items.add(m.time);
+                      }
+                      items.add(m);
+                      prev = m.time;
+                    }
+                    if (typing) items.add('typing');
+                    return ListView.builder(
+                      controller: _scroll,
+                      padding: const EdgeInsets.all(10),
+                      itemCount: items.length,
+                      itemBuilder: (context, i) {
+                        final it = items[i];
+                        if (it is DateTime) return _daySep(it);
+                        if (it is Msg) return _bubble(it);
+                        return _typingBubble();
+                      },
+                    );
+                  }),
                 ),
                 SafeArea(
                   top: false,
@@ -1024,7 +1194,9 @@ class _ChatPageState extends State<ChatPage> {
                             decoration: InputDecoration(
                               hintText: 'Message',
                               filled: true,
-                              fillColor: Colors.white,
+                              fillColor: _dark(context)
+                                  ? const Color(0xFF202C33)
+                                  : Colors.white,
                               contentPadding: const EdgeInsets.symmetric(
                                   horizontal: 16, vertical: 10),
                               border: OutlineInputBorder(
@@ -1054,13 +1226,120 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  bool _dark(BuildContext context) =>
+      Theme.of(context).brightness == Brightness.dark;
+
+  Widget _daySep(DateTime t) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final diff = today.difference(DateTime(t.year, t.month, t.day)).inDays;
+    final label = diff == 0
+        ? 'Aujourd\'hui'
+        : diff == 1
+            ? 'Hier'
+            : '${t.day.toString().padLeft(2, '0')}/'
+                '${t.month.toString().padLeft(2, '0')}/${t.year}';
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        decoration: BoxDecoration(
+          color: _dark(context)
+              ? const Color(0xFF182229)
+              : const Color(0xFFFFF3C4),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                fontSize: 12,
+                color: _dark(context) ? Colors.white70 : Colors.black87)),
+      ),
+    );
+  }
+
+  Future<void> _msgMenu(Msg m) async {
+    final isLast = c.messages.isNotEmpty && identical(c.messages.last, m);
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.copy),
+            title: const Text('Copier'),
+            onTap: () {
+              Navigator.pop(ctx);
+              Clipboard.setData(ClipboardData(text: m.text));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('Message copié'),
+                  duration: Duration(seconds: 1)));
+            },
+          ),
+          if (m.fromMe)
+            ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('Modifier et renvoyer'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _editDialog(m);
+              },
+            ),
+          if (isLast && !m.fromMe)
+            ListTile(
+              leading: const Icon(Icons.refresh),
+              title: const Text('Régénérer la réponse'),
+              onTap: () {
+                Navigator.pop(ctx);
+                unawaited(brain.regenerate(c));
+              },
+            ),
+          ListTile(
+            leading: const Icon(Icons.delete, color: Colors.red),
+            title: const Text('Supprimer ce message'),
+            onTap: () {
+              Navigator.pop(ctx);
+              brain.deleteMessage(c, m);
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _editDialog(Msg m) async {
+    if (!brain.ready) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Charge d\'abord un modèle (icône puce).')));
+      return;
+    }
+    final ctrl = TextEditingController(text: m.text);
+    final text = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Modifier le message'),
+        content: TextField(controller: ctrl, autofocus: true, maxLines: 5, minLines: 1),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: const Text('Renvoyer')),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    if (text != null && text.isNotEmpty) {
+      unawaited(brain.editAndResend(c, m, text));
+    }
+  }
+
   Widget _typingBubble() => Align(
         alignment: Alignment.centerLeft,
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 3),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
-              color: Colors.white, borderRadius: BorderRadius.circular(12)),
+              color: _dark(context) ? const Color(0xFF202C33) : Colors.white,
+              borderRadius: BorderRadius.circular(12)),
           child: const SizedBox(
               width: 24,
               height: 14,
@@ -1072,19 +1351,16 @@ class _ChatPageState extends State<ChatPage> {
     return Align(
       alignment: m.fromMe ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
-        onLongPress: () {
-          Clipboard.setData(ClipboardData(text: m.text));
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text('Message copié'),
-              duration: Duration(seconds: 1)));
-        },
+        onLongPress: () => _msgMenu(m),
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 3),
           padding: const EdgeInsets.fromLTRB(10, 7, 10, 5),
           constraints: BoxConstraints(
               maxWidth: MediaQuery.of(context).size.width * 0.78),
           decoration: BoxDecoration(
-            color: m.fromMe ? _bubbleMe : Colors.white,
+            color: m.fromMe
+                ? (_dark(context) ? const Color(0xFF005C4B) : _bubbleMe)
+                : (_dark(context) ? const Color(0xFF202C33) : Colors.white),
             borderRadius: BorderRadius.only(
               topLeft: const Radius.circular(12),
               topRight: const Radius.circular(12),
@@ -1098,13 +1374,20 @@ class _ChatPageState extends State<ChatPage> {
             children: [
               Align(
                   alignment: Alignment.centerLeft,
-                  child: Text(m.text, style: const TextStyle(fontSize: 15.5))),
+                  child: Text(m.text,
+                      style: TextStyle(
+                          fontSize: 15.5,
+                          color: _dark(context)
+                              ? Colors.white
+                              : Colors.black87))),
               const SizedBox(height: 2),
               Text(
                 m.seconds != null
                     ? '${_hhmm(m.time)} · ⏱ ${m.seconds!.toStringAsFixed(1)} s'
                     : _hhmm(m.time),
-                style: const TextStyle(fontSize: 10.5, color: Colors.black45),
+                style: TextStyle(
+                    fontSize: 10.5,
+                    color: _dark(context) ? Colors.white54 : Colors.black45),
               ),
             ],
           ),
