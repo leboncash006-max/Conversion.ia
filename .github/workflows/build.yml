@@ -1,0 +1,35 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Creer le projet
+        run: |
+          flutter create ia_test --platforms=android
+          cp main.dart ia_test/lib/main.dart
+          cd ia_test
+          flutter pub add flutter_litert_lm path_provider
+          sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+      - name: Compiler
+        run: |
+          cd ia_test
+          flutter build apk --release --target-platform android-arm64
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: ia_test/build/app/outputs/flutter-apk/app-release.apk
