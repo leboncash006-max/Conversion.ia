@@ -243,7 +243,7 @@ class Brain extends ChangeNotifier {
       contacts.add(Contact(
         id: DateTime.now().microsecondsSinceEpoch.toString(),
         name: 'Léo',
-        age: 18,
+        age: 12,
         description: 'pote un peu sarcastique mais sympa, passionné de jeux '
             'vidéo et de voitures',
         color: _palette[0],
