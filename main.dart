@@ -12,8 +12,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_litert_lm/flutter_litert_lm.dart';
 import 'package:path_provider/path_provider.dart';
@@ -116,6 +118,7 @@ class Contact {
     required this.age,
     required this.description,
     required this.color,
+    this.script = '',
     List<Msg>? messages,
   }) : messages = messages ?? [];
 
@@ -124,6 +127,7 @@ class Contact {
   int age;
   String description;
   int color;
+  String script; // réponses préenregistrées (texte du .txt importé)
   final List<Msg> messages;
 
   Map<String, dynamic> toJson() => {
@@ -132,6 +136,7 @@ class Contact {
         'age': age,
         'description': description,
         'color': color,
+        'script': script,
         'messages': [for (final m in messages) m.toJson()],
       };
 
@@ -141,6 +146,7 @@ class Contact {
         age: (j['age'] as num?)?.toInt() ?? 10,
         description: j['description'] as String? ?? '',
         color: (j['color'] as num?)?.toInt() ?? 0xFF128C7E,
+        script: j['script'] as String? ?? '',
         messages: [
           for (final m in (j['messages'] as List? ?? const []))
             Msg.fromJson(Map<String, dynamic>.from(m as Map)),
@@ -169,6 +175,99 @@ class Msg {
         time: DateTime.fromMillisecondsSinceEpoch((j['ts'] as num?)?.toInt() ?? 0),
         seconds: (j['s'] as num?)?.toDouble(),
       );
+}
+
+// ---------------------------------------------------------------
+//  Réponses préenregistrées (fichier .txt importé)
+//
+//  Format, une règle par ligne :
+//    # commentaire
+//    bonjour | salut | coucou => Salut ! | Hey, ça va ?
+//    ça va => Super, et toi ?
+//    * => Réponse quand rien ne correspond
+//  - à gauche : un ou plusieurs mots/phrases déclencheurs (séparés par |)
+//  - à droite : une ou plusieurs réponses (séparées par |), une est tirée
+//    au hasard ; \\n dans une réponse = retour à la ligne
+//  - la casse, les accents et la ponctuation sont ignorés
+// ---------------------------------------------------------------
+class ScriptRule {
+  ScriptRule(this.triggers, this.replies);
+  final List<String> triggers;
+  final List<String> replies;
+}
+
+class ScriptBook {
+  ScriptBook(this.rules, this.fallback);
+  final List<ScriptRule> rules;
+  final List<String> fallback;
+
+  static final _rng = Random();
+
+  static const _accents = {
+    'à': 'a', 'â': 'a', 'ä': 'a', 'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
+    'î': 'i', 'ï': 'i', 'ô': 'o', 'ö': 'o', 'ù': 'u', 'û': 'u', 'ü': 'u',
+    'ç': 'c', 'œ': 'oe', 'æ': 'ae',
+  };
+
+  static String norm(String s) {
+    final b = StringBuffer();
+    for (final ch in s.toLowerCase().split('')) {
+      b.write(_accents[ch] ?? ch);
+    }
+    return b
+        .toString()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+        .trim();
+  }
+
+  static ScriptBook parse(String raw) {
+    final rules = <ScriptRule>[];
+    final fallback = <String>[];
+    for (var line in raw.split('\n')) {
+      line = line.trim();
+      if (line.isEmpty || line.startsWith('#')) continue;
+      final i = line.indexOf('=>');
+      if (i < 0) continue;
+      final left = line.substring(0, i).trim();
+      final replies = [
+        for (final r in line.substring(i + 2).split('|'))
+          if (r.trim().isNotEmpty) r.trim().replaceAll('\\n', '\n'),
+      ];
+      if (replies.isEmpty) continue;
+      if (left == '*') {
+        fallback.addAll(replies);
+        continue;
+      }
+      final triggers = [
+        for (final t in left.split('|'))
+          if (norm(t).isNotEmpty) norm(t),
+      ];
+      if (triggers.isNotEmpty) rules.add(ScriptRule(triggers, replies));
+    }
+    return ScriptBook(rules, fallback);
+  }
+
+  bool get isEmpty => rules.isEmpty && fallback.isEmpty;
+
+  String? reply(String message) {
+    final n = norm(message);
+    ScriptRule? best;
+    var bestLen = -1;
+    for (final r in rules) {
+      for (final t in r.triggers) {
+        if (n == t) {
+          return r.replies[_rng.nextInt(r.replies.length)];
+        }
+        if (' $n '.contains(' $t ') && t.length > bestLen) {
+          best = r;
+          bestLen = t.length;
+        }
+      }
+    }
+    if (best != null) return best.replies[_rng.nextInt(best.replies.length)];
+    if (fallback.isNotEmpty) return fallback[_rng.nextInt(fallback.length)];
+    return null;
+  }
 }
 
 const _palette = <int>[
@@ -534,7 +633,8 @@ class Brain extends ChangeNotifier {
   }
 
   Future<void> send(Contact c, String text) async {
-    if (!ready || generating.contains(c.id)) return;
+    final book = _bookFor(c);
+    if ((book == null && !ready) || generating.contains(c.id)) return;
     c.messages.add(Msg(text, fromMe: true));
     generating.add(c.id);
     notifyListeners();
@@ -542,6 +642,16 @@ class Brain extends ChangeNotifier {
 
     final sw = Stopwatch()..start();
     try {
+      if (book != null) {
+        // Réponse préenregistrée : pas besoin du modèle IA.
+        await Future<void>.delayed(
+            Duration(milliseconds: 600 + Random().nextInt(900)));
+        final r = book.reply(text);
+        c.messages.add(Msg(
+            r ?? 'Aucune réponse préenregistrée ne correspond à ce message.',
+            fromMe: false));
+        return;
+      }
       // La conversation est créée avant l'envoi : l'historique du prompt
       // ne doit pas contenir le message en cours.
       if (!_convs.containsKey(c.id)) {
@@ -563,9 +673,18 @@ class Brain extends ChangeNotifier {
     }
   }
 
+  // ----- Réponses préenregistrées -----
+  ScriptBook? _bookFor(Contact c) {
+    if (c.script.trim().isEmpty) return null;
+    final b = ScriptBook.parse(c.script);
+    return b.isEmpty ? null : b;
+  }
+
+  bool canReply(Contact c) => ready || _bookFor(c) != null;
+
   // ----- Confort de chat -----
   Future<void> regenerate(Contact c) async {
-    if (generating.contains(c.id) || !ready) return;
+    if (generating.contains(c.id) || !canReply(c)) return;
     while (c.messages.isNotEmpty && !c.messages.last.fromMe) {
       c.messages.removeLast();
     }
@@ -584,7 +703,7 @@ class Brain extends ChangeNotifier {
   }
 
   Future<void> editAndResend(Contact c, Msg m, String text) async {
-    if (generating.contains(c.id) || !ready) return;
+    if (generating.contains(c.id) || !canReply(c)) return;
     final i = c.messages.indexOf(m);
     if (i < 0) return;
     c.messages.removeRange(i, c.messages.length);
@@ -920,11 +1039,13 @@ class _ContactEditPageState extends State<ContactEditPage> {
   late final TextEditingController _desc;
   late double _age;
   late int _color;
+  String _script = '';
 
   @override
   void initState() {
     super.initState();
     final c = widget.contact;
+    _script = c?.script ?? '';
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
     _age = (c?.age ?? 12).clamp(10, 60).toDouble();
@@ -936,6 +1057,63 @@ class _ContactEditPageState extends State<ContactEditPage> {
     _name.dispose();
     _desc.dispose();
     super.dispose();
+  }
+
+  void _snack(String t) => ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text(t)));
+
+  Future<void> _importScript() async {
+    try {
+      final res = await FilePicker.platform
+          .pickFiles(type: FileType.any, withData: true);
+      if (res == null || res.files.isEmpty) return;
+      final f = res.files.first;
+      List<int>? bytes = f.bytes;
+      if (bytes == null && f.path != null) {
+        bytes = await File(f.path!).readAsBytes();
+      }
+      if (bytes == null) throw Exception('fichier illisible');
+      var txt = utf8.decode(bytes, allowMalformed: true);
+      if (txt.startsWith('\uFEFF')) txt = txt.substring(1);
+      final book = ScriptBook.parse(txt);
+      if (book.isEmpty) {
+        _snack('Aucune ligne valide (format : déclencheur => réponse).');
+        return;
+      }
+      setState(() => _script = txt);
+      _snack('${book.rules.length} règle(s) importée(s) — '
+          'touche ✓ pour enregistrer.');
+    } catch (e) {
+      _snack('Erreur d\'import : $e');
+    }
+  }
+
+  void _scriptHelp() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Format du fichier .txt'),
+        content: const SingleChildScrollView(
+          child: Text(
+            '# ceci est un commentaire\n'
+            'bonjour | salut | coucou => Salut ! | Hey, ça va ?\n'
+            'ça va => Super, et toi ?\n'
+            'tu fais quoi => Je joue à la console\\nEt toi ?\n'
+            '* => Hmm, je ne sais pas quoi dire.\n\n'
+            '• Gauche : un ou plusieurs déclencheurs séparés par |\n'
+            '• Droite : une ou plusieurs réponses séparées par | '
+            '(une est tirée au hasard)\n'
+            '• \\n = retour à la ligne dans une réponse\n'
+            '• La ligne « * » sert quand rien ne correspond\n'
+            '• Majuscules, accents et ponctuation sont ignorés',
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+        ],
+      ),
+    );
   }
 
   void _save() {
@@ -953,7 +1131,8 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..name = name
       ..age = _age.round()
       ..description = _desc.text.trim()
-      ..color = _color;
+      ..color = _color
+      ..script = _script;
     widget.brain.addOrUpdate(c);
     Navigator.pop(context);
   }
@@ -1030,6 +1209,42 @@ class _ContactEditPageState extends State<ContactEditPage> {
             ),
           ),
           const SizedBox(height: 16),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Réponses préenregistrées',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  Text(_script.trim().isEmpty
+                      ? 'Aucun fichier : ce contact répond avec l\'IA.'
+                      : '${ScriptBook.parse(_script).rules.length} règle(s) '
+                          'chargée(s) : ce contact répond avec le fichier, '
+                          'sans IA.'),
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 8, children: [
+                    OutlinedButton.icon(
+                      onPressed: _importScript,
+                      icon: const Icon(Icons.upload_file),
+                      label: const Text('Importer un .txt'),
+                    ),
+                    if (_script.trim().isNotEmpty)
+                      OutlinedButton.icon(
+                        onPressed: () => setState(() => _script = ''),
+                        icon: const Icon(Icons.close),
+                        label: const Text('Retirer'),
+                      ),
+                    TextButton(
+                        onPressed: _scriptHelp, child: const Text('Format ?')),
+                  ]),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           FilledButton(onPressed: _save, child: const Text('Enregistrer')),
         ],
       ),
@@ -1076,7 +1291,7 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _send() async {
     final text = _ctrl.text.trim();
     if (text.isEmpty) return;
-    if (!brain.ready) {
+    if (!brain.canReply(c)) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Charge d\'abord un modèle (icône puce en haut).')));
       return;
@@ -1306,7 +1521,7 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _editDialog(Msg m) async {
-    if (!brain.ready) {
+    if (!brain.canReply(c)) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Charge d\'abord un modèle (icône puce).')));
       return;

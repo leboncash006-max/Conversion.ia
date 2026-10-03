@@ -22,7 +22,7 @@ jobs:
           flutter create ia_test --platforms=android
           cp main.dart ia_test/lib/main.dart
           cd ia_test
-          flutter pub add flutter_litert_lm path_provider
+          flutter pub add flutter_litert_lm path_provider file_picker:^10.0.0
           sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
       - name: Compiler
