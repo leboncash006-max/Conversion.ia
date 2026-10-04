@@ -86,6 +86,22 @@ class ModelOption {
 
 const _customId = 'custom';
 
+// Fournisseurs d'IA en ligne : l'utilisateur colle sa propre clé API.
+class Provider {
+  const Provider(this.id, this.name, this.defaultModel, this.keyHint);
+  final String id;
+  final String name;
+  final String defaultModel;
+  final String keyHint;
+}
+
+const providers = <Provider>[
+  Provider('deepseek', 'DeepSeek', 'deepseek-chat', 'sk-…'),
+  Provider('claude', 'Claude (Anthropic)', 'claude-sonnet-5-5', 'sk-ant-…'),
+  Provider('gemini', 'Gemini (Google)', 'gemini-2.5-flash', 'AIza…'),
+  Provider('openai', 'OpenAI (ChatGPT)', 'gpt-4o-mini', 'sk-…'),
+];
+
 const baseModels = <ModelOption>[
   ModelOption(
     id: 'qwen25-1.5b',
@@ -316,8 +332,11 @@ class Brain extends ChangeNotifier {
   String modelId = baseModels.first.id;
   LiteLmBackend backend = LiteLmBackend.cpu;
   String customRepo = '';
-  String deepseekKey = ''; // clé API DeepSeek, stockée sur le téléphone
-  bool online = true; // true = répondre via DeepSeek au lieu du modèle local
+  // IA en ligne : 'local' ou l'id d'un fournisseur. Les clés restent sur le
+  // téléphone (jamais dans le code).
+  String provider = 'deepseek';
+  final Map<String, String> apiKeys = {};
+  final Map<String, String> apiModels = {}; // modèle choisi par fournisseur
 
   // État modèle
   final Set<String> downloaded = {};
@@ -346,7 +365,23 @@ class Brain extends ChangeNotifier {
           orElse: () => baseModels.first);
 
   bool get ready => _engine != null;
-  bool get onlineOk => online && deepseekKey.trim().isNotEmpty;
+  Provider? get activeProvider {
+    for (final p in providers) {
+      if (p.id == provider) return p;
+    }
+    return null;
+  }
+
+  String keyOf(String id) => (apiKeys[id] ?? '').trim();
+  String modelOf(Provider p) {
+    final m = (apiModels[p.id] ?? '').trim();
+    return m.isEmpty ? p.defaultModel : m;
+  }
+
+  bool get onlineOk {
+    final p = activeProvider;
+    return p != null && keyOf(p.id).isNotEmpty;
+  }
 
   // ----- Stockage -----
   File get _dataFile => File('${_dir.path}/app_data.json');
@@ -359,8 +394,18 @@ class Brain extends ChangeNotifier {
         final j = jsonDecode(await _dataFile.readAsString()) as Map;
         modelId = j['modelId'] as String? ?? modelId;
         customRepo = j['customRepo'] as String? ?? '';
-        deepseekKey = j['deepseekKey'] as String? ?? '';
-        online = j['online'] as bool? ?? true;
+        provider = j['provider'] as String? ??
+            ((j['online'] as bool? ?? true) ? 'deepseek' : 'local');
+        final k = j['apiKeys'];
+        if (k is Map) {
+          k.forEach((a, b) => apiKeys['$a'] = '$b');
+        }
+        final m = j['apiModels'];
+        if (m is Map) {
+          m.forEach((a, b) => apiModels['$a'] = '$b');
+        }
+        final legacy = j['deepseekKey'] as String? ?? '';
+        if (legacy.isNotEmpty) apiKeys.putIfAbsent('deepseek', () => legacy);
         backend = (j['gpu'] as bool? ?? false)
             ? LiteLmBackend.gpu
             : LiteLmBackend.cpu;
@@ -392,8 +437,9 @@ class Brain extends ChangeNotifier {
       await _dataFile.writeAsString(jsonEncode({
         'modelId': modelId,
         'customRepo': customRepo,
-        'deepseekKey': deepseekKey,
-        'online': online,
+        'provider': provider,
+        'apiKeys': apiKeys,
+        'apiModels': apiModels,
         'gpu': backend == LiteLmBackend.gpu,
         'contacts': [for (final c in contacts) c.toJson()],
       }));
@@ -448,14 +494,20 @@ class Brain extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setDeepseekKey(String v) {
-    deepseekKey = v.trim();
+  void setProvider(String id) {
+    provider = id;
     _scheduleSave();
     notifyListeners();
   }
 
-  void setOnline(bool v) {
-    online = v;
+  void setApiKey(String id, String v) {
+    apiKeys[id] = v.trim();
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setApiModel(String id, String v) {
+    apiModels[id] = v.trim();
     _scheduleSave();
     notifyListeners();
   }
@@ -683,35 +735,115 @@ class Brain extends ChangeNotifier {
     return out.trim();
   }
 
-  // ----- DeepSeek (en ligne) -----
-  Future<String> _askDeepseek(Contact c) async {
-    final msgs = <Map<String, String>>[
-      {'role': 'system', 'content': systemPrompt(c, withHistory: false)},
-      for (final m in c.messages.length > 30
-          ? c.messages.sublist(c.messages.length - 30)
-          : c.messages)
-        {'role': m.fromMe ? 'user' : 'assistant', 'content': m.text},
-    ];
+  // ----- IA en ligne (DeepSeek, Claude, Gemini, OpenAI) -----
+  // Historique au format user/assistant : il doit commencer par « user » et
+  // alterner (exigé par Claude et Gemini), donc on fusionne les messages
+  // consécutifs du même rôle.
+  List<Map<String, String>> _history(Contact c) {
+    final src = c.messages.length > 30
+        ? c.messages.sublist(c.messages.length - 30)
+        : c.messages;
+    final out = <Map<String, String>>[];
+    for (final m in src) {
+      final role = m.fromMe ? 'user' : 'assistant';
+      if (out.isNotEmpty && out.last['role'] == role) {
+        out.last['content'] = '${out.last['content']}\n${m.text}';
+      } else {
+        out.add({'role': role, 'content': m.text});
+      }
+    }
+    if (out.isEmpty || out.first['role'] != 'user') {
+      out.insert(0, {'role': 'user', 'content': '(début de la partie)'});
+    }
+    return out;
+  }
+
+  Future<String> _askOnline(Contact c) async {
+    final p = activeProvider!;
+    final key = keyOf(p.id);
+    final model = modelOf(p);
+    final system = systemPrompt(c, withHistory: false);
+    final hist = _history(c);
+    final temp = c.rp ? 1.0 : 0.9;
+
+    late final Uri url;
+    final headers = <String, String>{
+      HttpHeaders.contentTypeHeader: 'application/json',
+    };
+    late final Map<String, dynamic> body;
+    switch (p.id) {
+      case 'claude':
+        url = Uri.parse('https://api.anthropic.com/v1/messages');
+        headers['x-api-key'] = key;
+        headers['anthropic-version'] = '2023-06-01';
+        body = {
+          'model': model,
+          'max_tokens': 1024,
+          'temperature': temp.clamp(0, 1),
+          'system': system,
+          'messages': hist,
+        };
+      case 'gemini':
+        url = Uri.parse('https://generativelanguage.googleapis.com/v1beta/'
+            'models/$model:generateContent');
+        headers['x-goog-api-key'] = key;
+        body = {
+          'systemInstruction': {
+            'parts': [
+              {'text': system}
+            ]
+          },
+          'contents': [
+            for (final m in hist)
+              {
+                'role': m['role'] == 'user' ? 'user' : 'model',
+                'parts': [
+                  {'text': m['content']}
+                ],
+              },
+          ],
+          'generationConfig': {'temperature': temp},
+        };
+      default: // deepseek, openai : API compatible OpenAI
+        url = Uri.parse(p.id == 'openai'
+            ? 'https://api.openai.com/v1/chat/completions'
+            : 'https://api.deepseek.com/chat/completions');
+        headers[HttpHeaders.authorizationHeader] = 'Bearer $key';
+        body = {
+          'model': model,
+          'messages': [
+            {'role': 'system', 'content': system},
+            ...hist,
+          ],
+          'temperature': temp,
+        };
+    }
+
     final client = HttpClient();
     try {
-      final req = await client
-          .postUrl(Uri.parse('https://api.deepseek.com/chat/completions'));
-      req.headers
-        ..set(HttpHeaders.contentTypeHeader, 'application/json')
-        ..set(HttpHeaders.authorizationHeader, 'Bearer ${deepseekKey.trim()}');
-      req.add(utf8.encode(jsonEncode({
-        'model': 'deepseek-chat',
-        'messages': msgs,
-        'temperature': c.rp ? 1.1 : 0.9,
-      })));
+      final req = await client.postUrl(url);
+      headers.forEach(req.headers.set);
+      req.add(utf8.encode(jsonEncode(body)));
       final res = await req.close().timeout(const Duration(seconds: 90));
-      final body = await res.transform(utf8.decoder).join();
+      final txt = await res.transform(utf8.decoder).join();
       if (res.statusCode != 200) {
-        throw Exception('DeepSeek ${res.statusCode} : $body');
+        throw Exception('${p.name} ${res.statusCode} : $txt');
       }
-      final j = jsonDecode(body) as Map;
-      return (((j['choices'] as List).first as Map)['message'] as Map)['content']
-          as String;
+      final j = jsonDecode(txt) as Map;
+      switch (p.id) {
+        case 'claude':
+          return [
+            for (final part in j['content'] as List)
+              if ((part as Map)['type'] == 'text') part['text'],
+          ].join();
+        case 'gemini':
+          final parts = (((j['candidates'] as List).first as Map)['content']
+              as Map)['parts'] as List;
+          return [for (final part in parts) (part as Map)['text'] ?? ''].join();
+        default:
+          return (((j['choices'] as List).first as Map)['message']
+              as Map)['content'] as String;
+      }
     } finally {
       client.close();
     }
@@ -738,7 +870,7 @@ class Brain extends ChangeNotifier {
         return;
       }
       if (onlineOk) {
-        _addReply(c, await _askDeepseek(c), sw);
+        _addReply(c, await _askOnline(c), sw);
         return;
       }
       // La conversation est créée avant l'envoi : l'historique du prompt
@@ -1217,7 +1349,7 @@ class _ChatsPageState extends State<ChatsPage> {
                   child: ListTile(
                     dense: true,
                     leading: const Icon(Icons.warning_amber),
-                    title: const Text('Clé DeepSeek manquante'),
+                    title: const Text('Aucune IA configurée'),
                     subtitle: const Text('Touche pour ajouter ta clé API'),
                     onTap: () => Navigator.push(
                         context,
@@ -1998,6 +2130,7 @@ class ModelsPage extends StatefulWidget {
 class _ModelsPageState extends State<ModelsPage> {
   late final TextEditingController _repo;
   late final TextEditingController _key;
+  late final TextEditingController _apiModel;
 
   Brain get b => widget.brain;
 
@@ -2005,13 +2138,21 @@ class _ModelsPageState extends State<ModelsPage> {
   void initState() {
     super.initState();
     _repo = TextEditingController(text: b.customRepo);
-    _key = TextEditingController(text: b.deepseekKey);
+    _key = TextEditingController();
+    _apiModel = TextEditingController();
+    _syncFields();
+  }
+
+  void _syncFields() {
+    _key.text = b.keyOf(b.provider);
+    _apiModel.text = b.apiModels[b.provider] ?? '';
   }
 
   @override
   void dispose() {
     _repo.dispose();
     _key.dispose();
+    _apiModel.dispose();
     super.dispose();
   }
 
@@ -2041,28 +2182,55 @@ class _ModelsPageState extends State<ModelsPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('DeepSeek (en ligne)',
+                      const Text('IA en ligne (ta clé API)',
                           style: TextStyle(
                               fontSize: 18, fontWeight: FontWeight.bold)),
                       const SizedBox(height: 8),
-                      TextField(
-                        controller: _key,
-                        obscureText: true,
-                        onChanged: b.setDeepseekKey,
+                      DropdownButtonFormField<String>(
+                        value: b.provider,
                         decoration: const InputDecoration(
-                          labelText: 'Clé API DeepSeek',
-                          helperText: 'Stockée uniquement sur ce téléphone',
-                          border: OutlineInputBorder(),
+                            labelText: 'Fournisseur',
+                            border: OutlineInputBorder()),
+                        items: [
+                          const DropdownMenuItem(
+                              value: 'local',
+                              child: Text('Modèle local (hors ligne)')),
+                          for (final p in providers)
+                            DropdownMenuItem(value: p.id, child: Text(p.name)),
+                        ],
+                        onChanged: (v) {
+                          if (v == null) return;
+                          b.setProvider(v);
+                          _syncFields();
+                        },
+                      ),
+                      if (b.activeProvider != null) ...[
+                        const SizedBox(height: 12),
+                        TextField(
+                          key: ValueKey('key-${b.provider}'),
+                          controller: _key,
+                          obscureText: true,
+                          onChanged: (v) => b.setApiKey(b.provider, v),
+                          decoration: InputDecoration(
+                            labelText: 'Clé API ${b.activeProvider!.name}',
+                            hintText: b.activeProvider!.keyHint,
+                            helperText: 'Stockée uniquement sur ce téléphone',
+                            border: const OutlineInputBorder(),
+                          ),
                         ),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Répondre avec DeepSeek'),
-                        subtitle: const Text(
-                            'Nécessite internet ; sinon modèle local'),
-                        value: b.online,
-                        onChanged: b.setOnline,
-                      ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          key: ValueKey('model-${b.provider}'),
+                          controller: _apiModel,
+                          onChanged: (v) => b.setApiModel(b.provider, v),
+                          decoration: InputDecoration(
+                            labelText: 'Modèle',
+                            hintText: b.activeProvider!.defaultModel,
+                            helperText: 'Laisse vide pour le modèle par défaut',
+                            border: const OutlineInputBorder(),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
