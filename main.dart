@@ -848,12 +848,24 @@ class Brain extends ChangeNotifier {
 
     final client = HttpClient();
     try {
-      final req = await client.postUrl(url);
-      headers.forEach(req.headers.set);
-      req.add(utf8.encode(jsonEncode(body)));
-      final res = await req.close().timeout(const Duration(seconds: 90));
-      final txt = await res.transform(utf8.decoder).join();
-      if (res.statusCode != 200) {
+      // Serveur surchargé / limite de débit : on réessaie quelques fois.
+      late String txt;
+      for (var attempt = 0;; attempt++) {
+        final req = await client.postUrl(url);
+        headers.forEach(req.headers.set);
+        req.add(utf8.encode(jsonEncode(body)));
+        final res = await req.close().timeout(const Duration(seconds: 90));
+        txt = await res.transform(utf8.decoder).join();
+        if (res.statusCode == 200) break;
+        final retry = const {429, 500, 502, 503, 504}.contains(res.statusCode);
+        if (retry && attempt < 3) {
+          await Future<void>.delayed(Duration(seconds: 2 + attempt * 3));
+          continue;
+        }
+        if (retry) {
+          throw Exception('${p.name} est surchargé (${res.statusCode}). '
+              'Réessaie dans un instant ou change de modèle.');
+        }
         throw Exception('${p.name} ${res.statusCode} : $txt');
       }
       final j = jsonDecode(txt) as Map;
