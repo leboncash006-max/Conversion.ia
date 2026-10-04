@@ -18,6 +18,8 @@ import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_litert_lm/flutter_litert_lm.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/timezone.dart' as tz;
 import 'package:path_provider/path_provider.dart';
 
 void main() => runApp(const MessengerApp());
@@ -127,6 +129,33 @@ const baseModels = <ModelOption>[
   ),
 ];
 
+// Réponse déjà générée par l'IA mais pas encore « arrivée » : le contact
+// écrit, ou il est parti et revient plus tard (comme un vrai humain).
+class PendingMsg {
+  PendingMsg(this.text, this.at, this.since, this.away, this.secs);
+  final String text;
+  final int at; // instant d'arrivée (ms depuis epoch)
+  final int since; // quand tu as écrit (pour « vu à HH:MM »)
+  final bool away; // true = absent, false = juste en train d'écrire
+  final double? secs;
+
+  Map<String, dynamic> toJson() => {
+        't': text,
+        'at': at,
+        'since': since,
+        'away': away,
+        if (secs != null) 's': secs,
+      };
+
+  static PendingMsg fromJson(Map<String, dynamic> j) => PendingMsg(
+        j['t'] as String? ?? '',
+        (j['at'] as num?)?.toInt() ?? 0,
+        (j['since'] as num?)?.toInt() ?? 0,
+        j['away'] as bool? ?? false,
+        (j['s'] as num?)?.toDouble(),
+      );
+}
+
 class Contact {
   Contact({
     required this.id,
@@ -138,8 +167,12 @@ class Contact {
     this.scenario = '',
     this.physical = '',
     this.rp = false,
+    this.memory = '',
+    this.memCount = 0,
     List<Msg>? messages,
-  }) : messages = messages ?? [];
+    List<PendingMsg>? pending,
+  })  : messages = messages ?? [],
+        pending = pending ?? [];
 
   final String id;
   String name;
@@ -150,7 +183,10 @@ class Contact {
   String physical; // description physique
   String scenario; // décor / situation de la partie de jeu de rôle
   bool rp; // true = mode jeu de rôle (narration), false = simple chat
+  String memory; // mémoire longue : résumé de tout ce qui est plus ancien
+  int memCount; // nombre de messages (du début) déjà résumés dans `memory`
   final List<Msg> messages;
+  final List<PendingMsg> pending;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -162,6 +198,9 @@ class Contact {
         'physical': physical,
         'scenario': scenario,
         'rp': rp,
+        'memory': memory,
+        'memCount': memCount,
+        'pending': [for (final m in pending) m.toJson()],
         'messages': [for (final m in messages) m.toJson()],
       };
 
@@ -175,6 +214,12 @@ class Contact {
         physical: j['physical'] as String? ?? '',
         scenario: j['scenario'] as String? ?? '',
         rp: j['rp'] as bool? ?? false,
+        memory: j['memory'] as String? ?? '',
+        memCount: (j['memCount'] as num?)?.toInt() ?? 0,
+        pending: [
+          for (final m in (j['pending'] as List? ?? const []))
+            PendingMsg.fromJson(Map<String, dynamic>.from(m as Map)),
+        ],
         messages: [
           for (final m in (j['messages'] as List? ?? const []))
             Msg.fromJson(Map<String, dynamic>.from(m as Map)),
@@ -325,6 +370,68 @@ String _dayLabel(DateTime t) {
 // ---------------------------------------------------------------
 //  Cerveau : stockage + modèle + conversations
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+//  Notifications : un message « en retard » est programmé auprès d'Android,
+//  il s'affiche même si l'app est fermée.
+// ---------------------------------------------------------------
+class Notifier {
+  static final _plugin = FlutterLocalNotificationsPlugin();
+  static bool _ready = false;
+
+  static Future<void> init() async {
+    try {
+      await _plugin.initialize(
+        settings: const InitializationSettings(
+            android: AndroidInitializationSettings('@mipmap/ic_launcher')),
+      );
+      _ready = true;
+      await requestPermission();
+    } catch (_) {}
+  }
+
+  static Future<void> requestPermission() async {
+    try {
+      await _plugin
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
+          ?.requestNotificationsPermission();
+    } catch (_) {}
+  }
+
+  // Un identifiant par contact : une nouvelle programmation remplace l'ancienne.
+  static int _id(Contact c) => c.id.hashCode & 0x7fffffff;
+
+  static Future<void> schedule(Contact c, String text, int atMs) async {
+    if (!_ready) return;
+    try {
+      if (atMs <= DateTime.now().millisecondsSinceEpoch + 500) return;
+      await _plugin.zonedSchedule(
+        id: _id(c),
+        title: c.name,
+        body: text.length > 120 ? '${text.substring(0, 120)}…' : text,
+        scheduledDate: tz.TZDateTime.fromMillisecondsSinceEpoch(tz.UTC, atMs),
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'messages',
+            'Messages',
+            channelDescription: 'Réponses de tes contacts',
+            importance: Importance.high,
+            priority: Priority.high,
+          ),
+        ),
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> cancel(Contact c) async {
+    if (!_ready) return;
+    try {
+      await _plugin.cancel(id: _id(c));
+    } catch (_) {}
+  }
+}
+
 class Brain extends ChangeNotifier {
   final List<Contact> contacts = [];
 
@@ -349,6 +456,13 @@ class Brain extends ChangeNotifier {
   LiteLmEngine? _engine;
   final Map<String, LiteLmConversation> _convs = {};
   final Set<String> generating = {};
+  final Set<String> _memBusy = {};
+
+  // Comportement « humain »
+  bool human = true; // absences réalistes
+  bool notifs = true; // notifications des réponses en retard
+  bool foreground = true;
+  Timer? _ticker;
 
   late Directory _dir;
   Timer? _saveTimer;
@@ -394,6 +508,8 @@ class Brain extends ChangeNotifier {
         final j = jsonDecode(await _dataFile.readAsString()) as Map;
         modelId = j['modelId'] as String? ?? modelId;
         customRepo = j['customRepo'] as String? ?? '';
+        human = j['human'] as bool? ?? true;
+        notifs = j['notifs'] as bool? ?? true;
         provider = j['provider'] as String? ??
             ((j['online'] as bool? ?? true) ? 'deepseek' : 'local');
         final k = j['apiKeys'];
@@ -432,6 +548,8 @@ class Brain extends ChangeNotifier {
       ));
     }
     await refreshDownloaded();
+    flushDue();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) => flushDue());
   }
 
   void _scheduleSave() {
@@ -444,6 +562,8 @@ class Brain extends ChangeNotifier {
       await _dataFile.writeAsString(jsonEncode({
         'modelId': modelId,
         'customRepo': customRepo,
+        'human': human,
+        'notifs': notifs,
         'v': 2,
         'provider': provider,
         'apiKeys': apiKeys,
@@ -472,13 +592,23 @@ class Brain extends ChangeNotifier {
 
   void deleteContact(Contact c) {
     contacts.remove(c);
+    _dropPending(c);
     _dropConv(c.id);
     _scheduleSave();
     notifyListeners();
   }
 
+  void _dropPending(Contact c) {
+    if (c.pending.isEmpty) return;
+    c.pending.clear();
+    unawaited(Notifier.cancel(c));
+  }
+
   void clearChat(Contact c) {
     c.messages.clear();
+    c.memory = '';
+    c.memCount = 0;
+    _dropPending(c);
     _dropConv(c.id);
     _scheduleSave();
     notifyListeners();
@@ -498,6 +628,19 @@ class Brain extends ChangeNotifier {
 
   void setBackend(LiteLmBackend b) {
     backend = b;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setHuman(bool v) {
+    human = v;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setNotifs(bool v) {
+    notifs = v;
+    if (v) unawaited(Notifier.requestPermission());
     _scheduleSave();
     notifyListeners();
   }
@@ -724,6 +867,14 @@ class Brain extends ChangeNotifier {
       ..writeln('Exemples de ton style : « slt » · « ça va et toi ? » · '
           '« chui chez moi, et toi ? » · « mdr nan » · « jsp, pk ? »');
   }
+  if (c.memory.trim().isNotEmpty) {
+    buf
+      ..writeln('')
+      ..writeln('MÉMOIRE DE VOTRE RELATION (tout ce qui s\'est passé avant les '
+          'derniers messages ; tu t\'en souviens parfaitement et tu restes '
+          'cohérent avec, sans la réciter) :')
+      ..writeln(c.memory.trim());
+  }
   // Mémoire : on rejoue les derniers messages dans le contexte.
   final hist = c.messages.length > 14
       ? c.messages.sublist(c.messages.length - 14)
@@ -767,9 +918,8 @@ class Brain extends ChangeNotifier {
   // alterner (exigé par Claude et Gemini), donc on fusionne les messages
   // consécutifs du même rôle.
   List<Map<String, String>> _history(Contact c) {
-    final src = c.messages.length > 30
-        ? c.messages.sublist(c.messages.length - 30)
-        : c.messages;
+    final from = min(c.memCount, c.messages.length);
+    final src = c.messages.sublist(from);
     final out = <Map<String, String>>[];
     for (final m in src) {
       final role = m.fromMe ? 'user' : 'assistant';
@@ -785,13 +935,15 @@ class Brain extends ChangeNotifier {
     return out;
   }
 
-  Future<String> _askOnline(Contact c) async {
+  Future<String> _askOnline(Contact c) => _complete(
+      systemPrompt(c, withHistory: false), _history(c), c.rp ? 1.0 : 0.9);
+
+  Future<String> _complete(
+      String system, List<Map<String, String>> hist, double temp,
+      {int maxTokens = 1024}) async {
     final p = activeProvider!;
     final key = keyOf(p.id);
     final model = modelOf(p);
-    final system = systemPrompt(c, withHistory: false);
-    final hist = _history(c);
-    final temp = c.rp ? 1.0 : 0.9;
 
     late final Uri url;
     final headers = <String, String>{
@@ -805,7 +957,7 @@ class Brain extends ChangeNotifier {
         headers['anthropic-version'] = '2023-06-01';
         body = {
           'model': model,
-          'max_tokens': 1024,
+          'max_tokens': maxTokens,
           'temperature': temp.clamp(0, 1),
           'system': system,
           'messages': hist,
@@ -891,6 +1043,11 @@ class Brain extends ChangeNotifier {
   Future<void> send(Contact c, String text) async {
     final book = _bookFor(c);
     if (!canReply(c) || generating.contains(c.id)) return;
+    // Si le contact était parti, il revient à l'heure prévue et répond à tout.
+    final keepAt = (c.pending.isNotEmpty && c.pending.first.away)
+        ? c.pending.first.at
+        : null;
+    _dropPending(c);
     c.messages.add(Msg(text, fromMe: true));
     generating.add(c.id);
     notifyListeners();
@@ -909,7 +1066,7 @@ class Brain extends ChangeNotifier {
         return;
       }
       if (onlineOk) {
-        _addReply(c, await _askOnline(c), sw);
+        _addReply(c, await _askOnline(c), sw, keepAt: keepAt);
         return;
       }
       // La conversation est créée avant l'envoi : l'historique du prompt
@@ -930,7 +1087,137 @@ class Brain extends ChangeNotifier {
       generating.remove(c.id);
       notifyListeners();
       _scheduleSave();
+      unawaited(_maybeSummarize(c));
     }
+  }
+
+  // ----- Mémoire longue -----
+  // On garde ~200 messages mot à mot ; tout ce qui est plus ancien est
+  // résumé (sans rien perdre) dans c.memory, réinjecté à chaque requête.
+  Future<void> _maybeSummarize(Contact c) async {
+    if (!onlineOk || _memBusy.contains(c.id)) return;
+    c.memCount = min(c.memCount, c.messages.length);
+    if (c.messages.length - c.memCount < 260) return;
+    final upto = c.messages.length - 200;
+    final chunk = c.messages.sublist(c.memCount, upto);
+    _memBusy.add(c.id);
+    try {
+      final tr = StringBuffer();
+      for (final m in chunk) {
+        tr.writeln('${m.fromMe ? 'Joueur' : c.name} : ${m.text}');
+      }
+      final out = await _complete(
+        'Tu es le gestionnaire de mémoire du personnage ${c.name}. Tu mets à '
+        'jour sa mémoire à partir d\'une conversation. Conserve TOUS les faits '
+        'précis : prénoms, âges, lieux, dates, chiffres, goûts, secrets, '
+        'promesses, disputes, événements, projets, état de la relation, '
+        'surnoms, expressions récurrentes, ce que le joueur a dit de lui. '
+        'Fusionne avec l\'ancienne mémoire sans rien perdre (ne retire un fait '
+        'que s\'il est contredit). Format : puces courtes groupées par thème, '
+        '1200 mots maximum. Réponds uniquement avec la mémoire mise à jour.',
+        [
+          {
+            'role': 'user',
+            'content': 'MÉMOIRE ACTUELLE :\n'
+                '${c.memory.trim().isEmpty ? '(vide)' : c.memory.trim()}\n\n'
+                'NOUVEAUX MESSAGES À INTÉGRER :\n$tr\n'
+                'Écris la mémoire mise à jour.'
+          }
+        ],
+        0.2,
+        maxTokens: 3000,
+      );
+      if (out.trim().isNotEmpty) {
+        c.memory = out.trim();
+        c.memCount = min(upto, c.messages.length);
+        _scheduleSave();
+      }
+    } catch (_) {
+      // On réessaiera au prochain message.
+    } finally {
+      _memBusy.remove(c.id);
+    }
+  }
+
+  // ----- Présence « humaine » -----
+  bool isAway(Contact c) => c.pending.isNotEmpty && c.pending.first.away;
+  bool isTyping(Contact c) =>
+      generating.contains(c.id) ||
+      (c.pending.isNotEmpty && !c.pending.first.away);
+
+  String statusOf(Contact c) {
+    if (isTyping(c)) return 'en train d\'écrire…';
+    if (isAway(c)) {
+      return 'hors ligne · vu à '
+          '${_hhmm(DateTime.fromMillisecondsSinceEpoch(c.pending.first.since))}';
+    }
+    return 'en ligne';
+  }
+
+  // Fait arriver les messages dont l'heure est venue. En arrière-plan on ne
+  // fait rien : c'est la notification programmée qui prévient.
+  void flushDue() {
+    if (!foreground) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var changed = false;
+    for (final c in contacts) {
+      var got = false;
+      while (c.pending.isNotEmpty && c.pending.first.at <= now) {
+        final m = c.pending.removeAt(0);
+        c.messages.add(Msg(m.text,
+            fromMe: false,
+            time: DateTime.fromMillisecondsSinceEpoch(m.at),
+            seconds: m.secs));
+        got = true;
+      }
+      if (got) {
+        changed = true;
+        if (c.pending.isEmpty) unawaited(Notifier.cancel(c));
+      }
+    }
+    if (changed) {
+      notifyListeners();
+      _scheduleSave();
+    }
+  }
+
+  void _queueReply(Contact c, List<String> parts, double secs, int? keepAt) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!human) {
+      for (var i = 0; i < parts.length; i++) {
+        c.messages.add(Msg(parts[i],
+            fromMe: false, seconds: i == 0 ? secs : null));
+      }
+      return;
+    }
+    final r = Random();
+    final lastMine = c.messages.lastWhere((m) => m.fromMe,
+        orElse: () => Msg('', fromMe: true));
+    final since = lastMine.time.millisecondsSinceEpoch;
+    int at;
+    var away = false;
+    if (keepAt != null && keepAt > now) {
+      at = keepAt;
+      away = true;
+    } else {
+      final roll = r.nextDouble();
+      if (roll < 0.70) {
+        // Il écrit : un temps de frappe proportionnel à la longueur.
+        at = now + min(6000, 1200 + parts.first.length * 45) + r.nextInt(1500);
+      } else if (roll < 0.95) {
+        at = now + (120 + r.nextInt(61)) * 1000; // parti 2 à 3 min
+        away = true;
+      } else {
+        at = now + (300 + r.nextInt(301)) * 1000; // parti 5 à 10 min
+        away = true;
+      }
+    }
+    var t = at;
+    for (var i = 0; i < parts.length; i++) {
+      c.pending.add(PendingMsg(parts[i], t, since, away && i == 0, i == 0 ? secs : null));
+      t += 1200 + r.nextInt(1500);
+    }
+    if (notifs) unawaited(Notifier.schedule(c, parts.first, at + 2500));
   }
 
   // ----- Réponses préenregistrées -----
@@ -957,6 +1244,8 @@ class Brain extends ChangeNotifier {
   void deleteMessage(Contact c, Msg m) {
     if (generating.contains(c.id)) return;
     c.messages.remove(m);
+    c.memCount = min(c.memCount, c.messages.length);
+    _dropPending(c);
     _dropConv(c.id);
     _scheduleSave();
     notifyListeners();
@@ -999,34 +1288,26 @@ class Brain extends ChangeNotifier {
     if (await flag.exists()) await flag.delete();
   }
 
-  void _addReply(Contact c, String? raw, Stopwatch sw) {
+  void _addReply(Contact c, String? raw, Stopwatch sw, {int? keepAt}) {
     var clean = _clean(raw ?? '');
     final secs = sw.elapsedMilliseconds / 1000;
+    var parts = <String>[clean.isEmpty ? '…' : clean];
     if (!c.rp) {
       // Messagerie : pas d'actions *entre astérisques*, et chaque ligne
       // devient une bulle séparée, comme de vrais SMS.
       clean = clean.replaceAll(RegExp(r'\*[^*]*\*'), '').trim();
-      final parts = [
+      final lines = [
         for (final l in clean.split(RegExp(r'\n+')))
           if (l.trim().isNotEmpty) l.trim(),
       ];
-      if (parts.isNotEmpty) {
-        for (var i = 0; i < parts.length && i < 3; i++) {
-          c.messages.add(Msg(parts[i],
-              fromMe: false, seconds: i == 0 ? secs : null));
-        }
-        return;
-      }
+      if (lines.isNotEmpty) parts = lines.take(3).toList();
     }
-    c.messages.add(Msg(
-      clean.isEmpty ? '…' : clean,
-      fromMe: false,
-      seconds: secs,
-    ));
+    _queueReply(c, parts, secs, keepAt);
   }
 
   @override
   void dispose() {
+    _ticker?.cancel();
     _saveTimer?.cancel();
     unload();
     super.dispose();
@@ -1279,13 +1560,22 @@ class Bootstrap extends StatefulWidget {
   State<Bootstrap> createState() => _BootstrapState();
 }
 
-class _BootstrapState extends State<Bootstrap> {
+class _BootstrapState extends State<Bootstrap> with WidgetsBindingObserver {
   final brain = Brain();
   bool _ready = false;
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final fg = state == AppLifecycleState.resumed;
+    brain.foreground = fg;
+    if (fg) brain.flushDue();
+  }
+
+  @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(Notifier.init());
     brain.init().then((_) {
       if (mounted) setState(() => _ready = true);
       unawaited(brain.autoLoad());
@@ -1294,6 +1584,7 @@ class _BootstrapState extends State<Bootstrap> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     brain.dispose();
     super.dispose();
   }
@@ -1420,7 +1711,7 @@ class _ChatsPageState extends State<ChatsPage> {
                   itemBuilder: (context, i) {
                     final c = shown[i];
                     final last = c.messages.isEmpty ? null : c.messages.last;
-                    final typing = brain.generating.contains(c.id);
+                    final typing = brain.isTyping(c);
                     return Dismissible(
                       key: ValueKey(c.id),
                       direction: DismissDirection.endToStart,
@@ -1863,7 +2154,7 @@ class _ChatPageState extends State<ChatPage> {
     return ListenableBuilder(
       listenable: brain,
       builder: (context, _) {
-        final typing = brain.generating.contains(c.id);
+        final typing = brain.isTyping(c);
         final count = c.messages.length + (typing ? 1 : 0);
         if (count != _lastCount) {
           _lastCount = count;
@@ -1880,7 +2171,7 @@ class _ChatPageState extends State<ChatPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(c.name, style: const TextStyle(fontSize: 17)),
-                    Text(typing ? 'en train d\'écrire…' : 'en ligne',
+                    Text(brain.statusOf(c),
                         style: const TextStyle(
                             fontSize: 12, fontWeight: FontWeight.normal)),
                   ],
@@ -2285,6 +2576,36 @@ class _ModelsPageState extends State<ModelsPage> {
                           ),
                         ),
                       ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Comportement humain',
+                          style: TextStyle(
+                              fontSize: 18, fontWeight: FontWeight.bold)),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Absences réalistes'),
+                        subtitle: const Text('Le contact écrit avec un délai '
+                            'et part parfois 2 à 3 min avant de répondre'),
+                        value: b.human,
+                        onChanged: b.setHuman,
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Notifications'),
+                        subtitle: const Text('Prévient quand une réponse '
+                            'arrive, même si l\'app est fermée'),
+                        value: b.notifs,
+                        onChanged: b.setNotifs,
+                      ),
                     ],
                   ),
                 ),

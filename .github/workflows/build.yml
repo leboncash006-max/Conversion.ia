@@ -22,9 +22,24 @@ jobs:
           flutter create ia_test --platforms=android
           cp main.dart ia_test/lib/main.dart
           cd ia_test
-          flutter pub add flutter_litert_lm path_provider file_picker:^10.0.0
+          flutter pub add flutter_litert_lm path_provider file_picker:^10.0.0 flutter_local_notifications:^22.3.1 timezone
           sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          # Notifications programmées : recepteurs Android + desugaring Java
+          sed -i 's#</application>#<receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />\n        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/><action android:name="android.intent.action.MY_PACKAGE_REPLACED"/></intent-filter></receiver>\n    </application>#' android/app/src/main/AndroidManifest.xml
+          python3 - <<'PY'
+          import glob
+          for f in glob.glob('android/app/build.gradle*'):
+              t = open(f).read()
+              if f.endswith('.kts'):
+                  t = t.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+                  t += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+              else:
+                  t = t.replace('compileOptions {', 'compileOptions {\n        coreLibraryDesugaringEnabled true', 1)
+                  t += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+              open(f, 'w').write(t)
+              print('patched', f)
+          PY
       - name: Compiler
         run: |
           cd ia_test
