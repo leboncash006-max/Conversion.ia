@@ -449,8 +449,24 @@ class Voice {
       File('$modelDir/tokens.txt').existsSync() &&
       Directory('$modelDir/espeak-ng-data').existsSync();
 
-  /// Fabrique un vocal (dans un isolate, un à la fois).
+  /// Des vocaux peuvent être fabriqués (ElevenLabs ou voix locale).
+  static bool get available => Eleven.ready || neuralReady;
+
+  /// Fabrique un vocal : ElevenLabs si configuré (repli sur la voix
+  /// locale en cas d'erreur réseau), sinon voix locale.
   static Future<({int ms, List<double> wave})> synth(
+      String text, String outPath, String preset) async {
+    if (Eleven.ready) {
+      try {
+        return await Eleven.synth(text, outPath);
+      } catch (e) {
+        if (!neuralReady) rethrow;
+      }
+    }
+    return _synthLocal(stripVoiceTags(text), outPath, preset);
+  }
+
+  static Future<({int ms, List<double> wave})> _synthLocal(
       String text, String outPath, String preset) {
     final (_, semi, speed) = voicePresets[preset] ?? voicePresets['ado']!;
     final dir = modelDir;
@@ -480,7 +496,7 @@ class Voice {
     _queue = _queue.then((_) async {
       if (g != _gen) return;
       try {
-        if (neuralReady) {
+        if (available) {
           final path = '$_appDirPath/lecture_${_tmp++ % 3}.wav';
           await synth(text, path, who.voice);
           if (g != _gen) return;
@@ -658,14 +674,16 @@ _Tone _toneOf(String s) {
   return _Tone.neutre;
 }
 
-String _spoken(String s) {
-  var t = s.replaceAll(_emojiRe, ' ').replaceAll(_laughRe, ' ');
+String _spoken(String s, {bool keepTags = false}) {
+  var t = s
+      .replaceAll(_emojiRe, ' ')
+      .replaceAll(_laughRe, keepTags ? ' [laughs] ' : ' ');
   t = t.replaceAllMapped(RegExp(r"[A-Za-zÀ-ÿ']+"), (m) {
     final w = m.group(0)!;
     return _spokenWords[w.toLowerCase()] ?? w;
   });
   return t
-      .replaceAll(RegExp(r'[*#_~<>\[\]]'), ' ')
+      .replaceAll(RegExp(keepTags ? r'[*#_~<>]' : r'[*#_~<>\[\]]'), ' ')
       .replaceAll(RegExp(r'([!?])\1+'), r'$1')
       .replaceAll(RegExp(r'\s+'), ' ')
       .trim();
@@ -764,57 +782,247 @@ void _shiftInto(List<double> out, Float32List x, double p, double gain,
           rng.nextDouble() * 0.12;
       out.addAll(List.filled((sr * pause).round(), 0.0));
     }
-    var peak = 0.0;
-    for (final v in out) {
-      peak = max(peak, v.abs());
-    }
-    final k = peak > 0 ? 0.9 / peak : 1.0;
-    // WAV 16 bits mono.
-    final data = ByteData(44 + out.length * 2);
-    void str(int o, String s) {
-      for (var i = 0; i < s.length; i++) {
-        data.setUint8(o + i, s.codeUnitAt(i));
-      }
-    }
-
-    str(0, 'RIFF');
-    data.setUint32(4, 36 + out.length * 2, Endian.little);
-    str(8, 'WAVEfmt ');
-    data.setUint32(16, 16, Endian.little);
-    data.setUint16(20, 1, Endian.little);
-    data.setUint16(22, 1, Endian.little);
-    data.setUint32(24, sr, Endian.little);
-    data.setUint32(28, sr * 2, Endian.little);
-    data.setUint16(32, 2, Endian.little);
-    data.setUint16(34, 16, Endian.little);
-    str(36, 'data');
-    data.setUint32(40, out.length * 2, Endian.little);
-    for (var i = 0; i < out.length; i++) {
-      data.setInt16(44 + i * 2,
-          (out[i] * k * 32767).round().clamp(-32768, 32767), Endian.little);
-    }
-    File(outPath).writeAsBytesSync(data.buffer.asUint8List());
-    // Forme d'onde pour la bulle.
-    const bars = 48;
-    final wave = <double>[];
-    final step = max(1, out.length ~/ bars);
-    for (var b = 0; b < bars; b++) {
-      var s = 0.0;
-      final from = b * step;
-      final to = min(out.length, from + step);
-      for (var i = from; i < to; i++) {
-        s += out[i] * out[i];
-      }
-      wave.add(to > from ? sqrt(s / (to - from)) * k : 0);
-    }
-    final top = wave.fold<double>(0, max);
-    return (
-      ms: out.length * 1000 ~/ sr,
-      wave: [for (final w in wave) top > 0 ? (w / top).clamp(0.08, 1.0) : 0.08],
-    );
+    return writeWav(out, sr, outPath);
   } finally {
     tts.free();
   }
+}
+
+/// Écrit [out] (échantillons -1…1) en WAV 16 bits mono normalisé, et
+/// renvoie la durée et la forme d'onde (48 barres) du vocal.
+({int ms, List<double> wave}) writeWav(
+    List<double> out, int sr, String outPath) {
+  var peak = 0.0;
+  for (final v in out) {
+    peak = max(peak, v.abs());
+  }
+  final k = peak > 0 ? 0.9 / peak : 1.0;
+  // WAV 16 bits mono.
+  final data = ByteData(44 + out.length * 2);
+  void str(int o, String s) {
+    for (var i = 0; i < s.length; i++) {
+      data.setUint8(o + i, s.codeUnitAt(i));
+    }
+  }
+
+  str(0, 'RIFF');
+  data.setUint32(4, 36 + out.length * 2, Endian.little);
+  str(8, 'WAVEfmt ');
+  data.setUint32(16, 16, Endian.little);
+  data.setUint16(20, 1, Endian.little);
+  data.setUint16(22, 1, Endian.little);
+  data.setUint32(24, sr, Endian.little);
+  data.setUint32(28, sr * 2, Endian.little);
+  data.setUint16(32, 2, Endian.little);
+  data.setUint16(34, 16, Endian.little);
+  str(36, 'data');
+  data.setUint32(40, out.length * 2, Endian.little);
+  for (var i = 0; i < out.length; i++) {
+    data.setInt16(44 + i * 2,
+        (out[i] * k * 32767).round().clamp(-32768, 32767), Endian.little);
+  }
+  File(outPath).writeAsBytesSync(data.buffer.asUint8List());
+  // Forme d'onde pour la bulle.
+  const bars = 48;
+  final wave = <double>[];
+  final step = max(1, out.length ~/ bars);
+  for (var b = 0; b < bars; b++) {
+    var s = 0.0;
+    final from = b * step;
+    final to = min(out.length, from + step);
+    for (var i = from; i < to; i++) {
+      s += out[i] * out[i];
+    }
+    wave.add(to > from ? sqrt(s / (to - from)) * k : 0);
+  }
+  final top = wave.fold<double>(0, max);
+  return (
+    ms: out.length * 1000 ~/ sr,
+    wave: [for (final w in wave) top > 0 ? (w / top).clamp(0.08, 1.0) : 0.08],
+  );
+}
+
+// ---------------------------------------------------------------
+//  ElevenLabs : voix ultra réaliste (en ligne, avec la clé API de
+//  l'utilisateur). Le modèle v3 comprend les émotions entre crochets.
+// ---------------------------------------------------------------
+const elevenDefaultDescription =
+    'A 15-year-old French teenage girl. Young, bright, slightly high-pitched '
+    'voice, lively and very expressive, casual and friendly, speaks naturally '
+    'and a bit fast like when sending a voice message to her best friend. '
+    'Native French accent from Paris, clear close-mic phone recording.';
+
+const elevenPreviewText =
+    'Coucou ! Ça va toi ? Franchement aujourd\'hui j\'ai trop rigolé avec '
+    'Inès, on s\'est fait virer du CDI tellement on riait. Par contre j\'ai '
+    'raté mon contrôle de maths… Tu fais quoi ce week-end ?';
+
+// Indications d'émotion comprises par eleven_v3.
+final _elTagRe = RegExp(r'\[([a-zA-Z][a-zA-Z ]{1,24})\]');
+
+/// Texte d'un vocal sans les indications d'émotion (pour la transcription).
+String stripVoiceTags(String t) =>
+    t.replaceAll(_elTagRe, '').replaceAll(RegExp(r'\s{2,}'), ' ').trim();
+
+/// Prépare un texte pour eleven_v3 : langage oral + émotions par phrase.
+String elevenText(String text) {
+  final b = StringBuffer();
+  for (final m in RegExp(r'[^.!?…]+[.!?…]*').allMatches(text)) {
+    final raw = m.group(0)!.trim();
+    if (raw.isEmpty) continue;
+    final say = _spoken(raw, keepTags: true);
+    if (!RegExp(r'[A-Za-zÀ-ÿ0-9]').hasMatch(stripVoiceTags(say))) {
+      if (say.contains('[')) b.write('$say ');
+      continue;
+    }
+    if (!_elTagRe.hasMatch(say)) {
+      final tag = switch (_toneOf(raw)) {
+        _Tone.triste => '[sad] ',
+        _Tone.colere => '[annoyed] ',
+        _Tone.joie when raw.trimRight().endsWith('!') => '[excited] ',
+        _ => '',
+      };
+      b.write(tag);
+    }
+    b.write('$say ');
+  }
+  final out = b.toString().trim();
+  return out.isEmpty ? text : out;
+}
+
+class Eleven {
+  static String key = '';
+  static String voiceId = '';
+  static String voiceName = '';
+
+  static bool get ready => key.isNotEmpty && voiceId.isNotEmpty;
+
+  static Future<List<int>> _post(String path, Map<String, dynamic> body,
+      {String? apiKey}) async {
+    final client = HttpClient();
+    try {
+      final req =
+          await client.postUrl(Uri.parse('https://api.elevenlabs.io$path'));
+      req.headers
+        ..set('xi-api-key', apiKey ?? key)
+        ..contentType = ContentType.json;
+      req.add(utf8.encode(jsonEncode(body)));
+      final res = await req.close();
+      final bytes = <int>[];
+      await for (final c in res) {
+        bytes.addAll(c);
+      }
+      if (res.statusCode != 200) {
+        var msg = utf8.decode(bytes, allowMalformed: true);
+        try {
+          final d = (jsonDecode(msg) as Map)['detail'];
+          msg = d is Map ? '${d['message'] ?? d}' : '$d';
+        } catch (_) {}
+        throw ElevenError(res.statusCode, msg);
+      }
+      return bytes;
+    } finally {
+      client.close();
+    }
+  }
+
+  /// Fabrique un vocal WAV avec la voix ElevenLabs choisie.
+  static Future<({int ms, List<double> wave})> synth(
+      String text, String outPath) async {
+    List<int> pcm;
+    try {
+      pcm = await _post(
+          '/v1/text-to-speech/$voiceId?output_format=pcm_22050', {
+        'text': elevenText(text),
+        'model_id': 'eleven_v3',
+        'language_code': 'fr',
+        'voice_settings': {'stability': 0.5},
+      });
+    } on ElevenError catch (e) {
+      if (e.code == 401 || e.code == 429) rethrow;
+      // Modèle v3 indisponible : modèle multilingue classique, sans balises.
+      pcm = await _post(
+          '/v1/text-to-speech/$voiceId?output_format=pcm_22050', {
+        'text': stripVoiceTags(_spoken(text)),
+        'model_id': 'eleven_multilingual_v2',
+        'voice_settings': {'stability': 0.35, 'similarity_boost': 0.8},
+      });
+    }
+    final bd = ByteData.sublistView(Uint8List.fromList(pcm));
+    final out = <double>[
+      for (var i = 0; i + 1 < pcm.length; i += 2)
+        bd.getInt16(i, Endian.little) / 32768,
+    ];
+    if (out.isEmpty) throw Exception('audio vide');
+    return writeWav(out, 22050, outPath);
+  }
+
+  /// Propose plusieurs voix à partir d'une description.
+  /// Renvoie (id provisoire, fichier audio d'essai).
+  static Future<List<(String, String)>> design(
+      String description, String apiKey) async {
+    List<int> bytes;
+    try {
+      bytes = await _post(
+          '/v1/text-to-voice/design',
+          {
+            'voice_description': description,
+            'model_id': 'eleven_ttv_v3',
+            'text': elevenPreviewText,
+          },
+          apiKey: apiKey);
+    } on ElevenError catch (e) {
+      if (e.code == 401) rethrow;
+      bytes = await _post(
+          '/v1/text-to-voice/create-previews',
+          {'voice_description': description, 'text': elevenPreviewText},
+          apiKey: apiKey);
+    }
+    final j = jsonDecode(utf8.decode(bytes)) as Map;
+    final res = <(String, String)>[];
+    var n = 0;
+    for (final p in (j['previews'] as List? ?? const [])) {
+      final m = p as Map;
+      final type = '${m['media_type'] ?? 'audio/mpeg'}';
+      final ext = type.contains('wav') ? 'wav' : 'mp3';
+      final path = '$_appDirPath/essai_voix_${n++}.$ext';
+      await File(path).writeAsBytes(base64Decode(m['audio_base_64'] as String));
+      res.add((m['generated_voice_id'] as String, path));
+    }
+    if (res.isEmpty) throw Exception('aucune voix proposée');
+    return res;
+  }
+
+  /// Enregistre une voix proposée dans le compte ElevenLabs.
+  static Future<String> save(String generatedId, String name,
+      String description, String apiKey) async {
+    final body = {
+      'voice_name': name,
+      'voice_description': description,
+      'generated_voice_id': generatedId,
+    };
+    List<int> bytes;
+    try {
+      bytes = await _post('/v1/text-to-voice', body, apiKey: apiKey);
+    } on ElevenError catch (e) {
+      if (e.code == 401) rethrow;
+      bytes = await _post('/v1/text-to-voice/create-voice-from-preview', body,
+          apiKey: apiKey);
+    }
+    return (jsonDecode(utf8.decode(bytes)) as Map)['voice_id'] as String;
+  }
+}
+
+class ElevenError implements Exception {
+  ElevenError(this.code, this.message);
+  final int code;
+  final String message;
+  @override
+  String toString() => code == 401
+      ? 'clé API ElevenLabs refusée'
+      : code == 429
+          ? 'quota ElevenLabs atteint'
+          : 'ElevenLabs ($code) : $message';
 }
 
 // ---------------------------------------------------------------
@@ -888,6 +1096,9 @@ class Brain extends ChangeNotifier {
             ? LiteLmBackend.gpu
             : LiteLmBackend.cpu;
         typingCps = (j['typingCps'] as num?)?.toInt() ?? typingCps;
+        Eleven.key = j['elevenKey'] as String? ?? '';
+        Eleven.voiceId = j['elevenVoiceId'] as String? ?? '';
+        Eleven.voiceName = j['elevenVoiceName'] as String? ?? '';
         for (final c in (j['contacts'] as List? ?? const [])) {
           contacts.add(Contact.fromJson(Map<String, dynamic>.from(c as Map)));
         }
@@ -918,6 +1129,9 @@ class Brain extends ChangeNotifier {
         'customRepo': customRepo,
         'gpu': backend == LiteLmBackend.gpu,
         'typingCps': typingCps,
+        'elevenKey': Eleven.key,
+        'elevenVoiceId': Eleven.voiceId,
+        'elevenVoiceName': Eleven.voiceName,
         'contacts': [for (final c in contacts) c.toJson()],
       };
 
@@ -1267,6 +1481,19 @@ class Brain extends ChangeNotifier {
     }
   }
 
+  /// Règle ElevenLabs (clé et/ou voix). Les consignes de l'IA changent.
+  Future<void> setEleven({String? key, String? voiceId, String? name}) async {
+    if (key != null) Eleven.key = key.trim();
+    if (voiceId != null) Eleven.voiceId = voiceId.trim();
+    if (name != null) Eleven.voiceName = name.trim();
+    for (final c in _convs.values) {
+      await c.dispose();
+    }
+    _convs.clear();
+    _scheduleSave();
+    notifyListeners();
+  }
+
   Future<void> deleteVoice() async {
     await Voice.stop();
     try {
@@ -1344,12 +1571,17 @@ class Brain extends ChangeNotifier {
           'd\'affilée quand c\'est naturel : sépare alors chaque message par '
           'une ligne contenant uniquement ---. Pas plus de 4 messages.');
     }
-    if (c.vocal && Voice.neuralReady) {
+    if (c.vocal && Voice.available) {
       buf.writeln('Tu peux aussi envoyer des messages vocaux, comme sur '
           'WhatsApp : quand tu en as envie (raconter un truc, réagir avec '
           'émotion, quand tu as la flemme d\'écrire, ou si on te le demande), '
           'commence ce message par [VOCAL] puis écris exactement ce que tu '
           'dis à l\'oral, avec ton ton et tes émotions. Pas à chaque fois.');
+      if (Eleven.ready) {
+        buf.writeln('Dans un vocal, tu peux indiquer tes émotions avec des '
+            'balises en anglais entre crochets, par exemple [laughs], '
+            '[sighs], [whispers], [excited], [sad], [giggles].');
+      }
     }
     if (c.memoryOn) {
       buf.writeln('Mémoire : quand ton ami(e) te dit quelque chose d\'important '
@@ -1743,7 +1975,7 @@ class Brain extends ChangeNotifier {
         _deletePhoto(name);
         return true;
       }
-      c.messages.add(Msg(text,
+      c.messages.add(Msg(stripVoiceTags(text),
           fromMe: false,
           from: author?.id,
           audio: name,
@@ -1786,7 +2018,7 @@ class Brain extends ChangeNotifier {
       }
       if (isVocal &&
           who.vocal &&
-          Voice.neuralReady &&
+          Voice.available &&
           await _sendVocal(c, p, sw, epoch, i == 0, author)) {
         continue;
       }
@@ -1795,6 +2027,8 @@ class Brain extends ChangeNotifier {
       if (i == 0) wait -= sw.elapsed;
       if (wait > Duration.zero) await Future<void>.delayed(wait);
       if ((_epoch[c.id] ?? 0) != epoch || !contacts.contains(c)) return;
+      if (Eleven.ready) p = stripVoiceTags(p);
+      if (p.isEmpty) continue;
       c.messages.add(Msg(
         p,
         fromMe: false,
@@ -2586,9 +2820,9 @@ class _ContactEditPageState extends State<ContactEditPage> {
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     title: const Text('Envoie des messages vocaux'),
-                    subtitle: Text(Voice.neuralReady
+                    subtitle: Text(Voice.available
                         ? 'Il/elle décide quand envoyer un vocal'
-                        : 'Installe d\'abord la voix dans « Modèles IA »'),
+                        : 'Configure d\'abord une voix dans « Modèles IA »'),
                     value: _vocal,
                     onChanged: (v) => setState(() => _vocal = v),
                   ),
@@ -3697,6 +3931,146 @@ class _VoiceBubbleState extends State<VoiceBubble> {
 }
 
 // ---------------------------------------------------------------
+//  Création d'une voix ElevenLabs (on choisit à l'oreille)
+// ---------------------------------------------------------------
+class VoiceDesignPage extends StatefulWidget {
+  const VoiceDesignPage({super.key, required this.brain});
+  final Brain brain;
+
+  @override
+  State<VoiceDesignPage> createState() => _VoiceDesignPageState();
+}
+
+class _VoiceDesignPageState extends State<VoiceDesignPage> {
+  final _desc = TextEditingController(text: elevenDefaultDescription);
+  final _name = TextEditingController(text: 'Ado 15 ans');
+  List<(String, String)> _previews = [];
+  int? _chosen;
+  bool _busy = false;
+  String _status = '';
+
+  @override
+  void dispose() {
+    AudioHub.i.stop();
+    _desc.dispose();
+    _name.dispose();
+    super.dispose();
+  }
+
+  Future<void> _generate() async {
+    setState(() {
+      _busy = true;
+      _status = 'Création des voix (≈ 20 s)…';
+      _previews = [];
+      _chosen = null;
+    });
+    try {
+      final res = await Eleven.design(_desc.text.trim(), Eleven.key);
+      setState(() {
+        _previews = res;
+        _status = 'Écoute les essais et choisis ta préférée.';
+      });
+    } catch (e) {
+      setState(() => _status = 'Erreur : $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _save() async {
+    final i = _chosen;
+    if (i == null) return;
+    setState(() {
+      _busy = true;
+      _status = 'Enregistrement de la voix…';
+    });
+    try {
+      final name = _name.text.trim().isEmpty ? 'Ado 15 ans' : _name.text.trim();
+      final id = await Eleven.save(
+          _previews[i].$1, name, _desc.text.trim(), Eleven.key);
+      await widget.brain.setEleven(voiceId: id, name: name);
+      if (mounted) Navigator.pop(context, id);
+    } catch (e) {
+      setState(() => _status = 'Erreur : $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Créer une voix')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('Décris la voix (en anglais, c\'est plus précis) :'),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _desc,
+            minLines: 4,
+            maxLines: 8,
+            decoration: const InputDecoration(border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: _busy ? null : _generate,
+            icon: const Icon(Icons.auto_awesome),
+            label: Text(_previews.isEmpty
+                ? 'Générer des essais'
+                : 'Générer d\'autres essais'),
+          ),
+          if (_busy) ...[
+            const SizedBox(height: 12),
+            const LinearProgressIndicator(),
+          ],
+          if (_status.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(_status),
+          ],
+          const SizedBox(height: 8),
+          ListenableBuilder(
+            listenable: AudioHub.i,
+            builder: (context, _) => RadioGroup<int>(
+              groupValue: _chosen,
+              onChanged: (v) => setState(() => _chosen = v),
+              child: Column(children: [
+                for (var i = 0; i < _previews.length; i++)
+                  RadioListTile<int>(
+                    value: i,
+                    title: Text('Essai ${i + 1}'),
+                    secondary: IconButton(
+                      iconSize: 34,
+                      icon: Icon(AudioHub.i.path == _previews[i].$2 &&
+                              AudioHub.i.playing
+                          ? Icons.pause_circle
+                          : Icons.play_circle),
+                      onPressed: () => AudioHub.i.toggle(_previews[i].$2),
+                    ),
+                  ),
+              ]),
+            ),
+          ),
+          if (_previews.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _name,
+              decoration: const InputDecoration(
+                  labelText: 'Nom de la voix', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: (_chosen == null || _busy) ? null : _save,
+              child: const Text('Utiliser cette voix'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------
 //  Gestion des modèles
 // ---------------------------------------------------------------
 class ModelsPage extends StatefulWidget {
@@ -3709,6 +4083,9 @@ class ModelsPage extends StatefulWidget {
 
 class _ModelsPageState extends State<ModelsPage> {
   late final TextEditingController _repo;
+  late final TextEditingController _elKey;
+  late final TextEditingController _elVoice;
+  bool _showKey = false;
 
   Brain get b => widget.brain;
 
@@ -3716,13 +4093,108 @@ class _ModelsPageState extends State<ModelsPage> {
   void initState() {
     super.initState();
     _repo = TextEditingController(text: b.customRepo);
+    _elKey = TextEditingController(text: Eleven.key);
+    _elVoice = TextEditingController(text: Eleven.voiceId);
   }
 
   @override
   void dispose() {
     _repo.dispose();
+    _elKey.dispose();
+    _elVoice.dispose();
     super.dispose();
   }
+
+  Widget _elevenSection() => Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Voix ElevenLabs (ultra réaliste)',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              const Text(
+                  'Utilisée en priorité pour les vocaux, avec les émotions '
+                  '(rires, soupirs, chuchotements…). Nécessite Internet : le '
+                  'texte des vocaux est envoyé à ElevenLabs et consomme ton '
+                  'quota de caractères.',
+                  style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _elKey,
+                obscureText: !_showKey,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: 'Clé API ElevenLabs',
+                  border: const OutlineInputBorder(),
+                  isDense: true,
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                        _showKey ? Icons.visibility_off : Icons.visibility),
+                    onPressed: () => setState(() => _showKey = !_showKey),
+                  ),
+                ),
+                onChanged: (v) => b.setEleven(key: v),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _elVoice,
+                autocorrect: false,
+                decoration: InputDecoration(
+                  labelText: 'ID de la voix',
+                  helperText: Eleven.voiceName.isEmpty
+                      ? 'Crée une voix ci-dessous, ou colle l\'ID d\'une voix'
+                      : 'Voix : ${Eleven.voiceName}',
+                  border: const OutlineInputBorder(),
+                  isDense: true,
+                ),
+                onChanged: (v) => b.setEleven(voiceId: v, name: ''),
+              ),
+              const SizedBox(height: 8),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                FilledButton.icon(
+                  onPressed: Eleven.key.isEmpty
+                      ? null
+                      : () async {
+                          final id = await Navigator.push<String>(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) => VoiceDesignPage(brain: b)));
+                          if (id != null) _elVoice.text = id;
+                        },
+                  icon: const Icon(Icons.auto_awesome),
+                  label: const Text('Créer une voix'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: Eleven.ready
+                      ? () {
+                          Voice.stop();
+                          Voice.speak(elevenPreviewText,
+                              Contact(
+                                  id: '_test',
+                                  name: '',
+                                  age: 15,
+                                  description: '',
+                                  color: 0));
+                        }
+                      : null,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Tester'),
+                ),
+              ]),
+              const SizedBox(height: 4),
+              Text(
+                  Eleven.ready
+                      ? '✅ Les vocaux utilisent ElevenLabs.'
+                      : 'Non configuré : les vocaux utilisent la voix locale '
+                          '(si installée).',
+                  style: const TextStyle(fontSize: 12)),
+            ],
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -3852,7 +4324,9 @@ class _ModelsPageState extends State<ModelsPage> {
                 Text(b.status),
               ],
               const SizedBox(height: 24),
-              const Text('Voix des messages vocaux',
+              _elevenSection(),
+              const SizedBox(height: 16),
+              const Text('Voix locale (hors ligne)',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               const SizedBox(height: 4),
               Text(
