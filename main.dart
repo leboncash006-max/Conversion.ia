@@ -120,16 +120,18 @@ class Contact {
     required this.color,
     this.script = '',
     this.scenario = '',
-    this.rp = false,
+    this.physical = '',
+    this.rp = true,
     List<Msg>? messages,
   }) : messages = messages ?? [];
 
   final String id;
   String name;
   int age;
-  String description;
+  String description; // description morale (caractère)
   int color;
   String script; // réponses préenregistrées (texte du .txt importé)
+  String physical; // description physique
   String scenario; // décor / situation de la partie de jeu de rôle
   bool rp; // true = mode jeu de rôle (narration), false = simple chat
   final List<Msg> messages;
@@ -141,6 +143,7 @@ class Contact {
         'description': description,
         'color': color,
         'script': script,
+        'physical': physical,
         'scenario': scenario,
         'rp': rp,
         'messages': [for (final m in messages) m.toJson()],
@@ -149,12 +152,13 @@ class Contact {
   static Contact fromJson(Map<String, dynamic> j) => Contact(
         id: j['id'] as String,
         name: j['name'] as String,
-        age: (j['age'] as num?)?.toInt() ?? 10,
+        age: ((j['age'] as num?)?.toInt() ?? 18).clamp(10, 50),
         description: j['description'] as String? ?? '',
         color: (j['color'] as num?)?.toInt() ?? 0xFF128C7E,
         script: j['script'] as String? ?? '',
+        physical: j['physical'] as String? ?? '',
         scenario: j['scenario'] as String? ?? '',
-        rp: j['rp'] as bool? ?? false,
+        rp: j['rp'] as bool? ?? true,
         messages: [
           for (final m in (j['messages'] as List? ?? const []))
             Msg.fromJson(Map<String, dynamic>.from(m as Map)),
@@ -313,7 +317,7 @@ class Brain extends ChangeNotifier {
   LiteLmBackend backend = LiteLmBackend.cpu;
   String customRepo = '';
   String deepseekKey = ''; // clé API DeepSeek, stockée sur le téléphone
-  bool online = false; // true = répondre via DeepSeek au lieu du modèle local
+  bool online = true; // true = répondre via DeepSeek au lieu du modèle local
 
   // État modèle
   final Set<String> downloaded = {};
@@ -356,7 +360,7 @@ class Brain extends ChangeNotifier {
         modelId = j['modelId'] as String? ?? modelId;
         customRepo = j['customRepo'] as String? ?? '';
         deepseekKey = j['deepseekKey'] as String? ?? '';
-        online = j['online'] as bool? ?? false;
+        online = j['online'] as bool? ?? true;
         backend = (j['gpu'] as bool? ?? false)
             ? LiteLmBackend.gpu
             : LiteLmBackend.cpu;
@@ -617,7 +621,9 @@ class Brain extends ChangeNotifier {
     buf
       ..writeln('Tu animes une partie de jeu de rôle en français avec le '
           'joueur. Tu incarnes ${c.name}, ${c.age} ans.')
-      ..writeln('Personnage : ${desc.isEmpty ? 'à imaginer' : desc}.')
+      ..writeln('Description physique : '
+          '${c.physical.trim().isEmpty ? 'non précisée' : c.physical.trim()}.')
+      ..writeln('Caractère et morale : ${desc.isEmpty ? 'à imaginer' : desc}.')
       ..writeln('Décor / situation : '
           '${c.scenario.trim().isEmpty ? 'libre, à toi de poser le décor' : c.scenario.trim()}.')
       ..writeln('Règles : tu parles à la première personne pour ${c.name} '
@@ -630,7 +636,9 @@ class Brain extends ChangeNotifier {
     buf
     ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
         '(style WhatsApp) avec ton ami(e).')
-    ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
+    ..writeln('Ton physique : '
+        '${c.physical.trim().isEmpty ? 'non précisé' : c.physical.trim()}.')
+    ..writeln('Ton caractère : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
     ..writeln('Tu écris en français, de façon naturelle et spontanée. '
         'Messages courts (1 à 3 phrases), parfois un emoji. '
         'Pas de narration, pas d\'astérisques, pas de didascalies.')
@@ -850,6 +858,7 @@ class Scenario {
     required this.pitch,
     required this.character,
     required this.age,
+    required this.physical,
     required this.persona,
     required this.setting,
     required this.opening,
@@ -860,6 +869,7 @@ class Scenario {
   final String pitch; // accroche affichée sur la carte
   final String character; // nom du personnage joué par l'IA
   final int age;
+  final String physical;
   final String persona;
   final String setting;
   final String opening; // premier message de la partie
@@ -872,6 +882,7 @@ const scenarios = <Scenario>[
     emoji: '🐉',
     pitch: 'Fantasy · une rumeur de trésor circule…',
     character: 'Maître Brann',
+    physical: 'grand et large d'épaules, barbe grise, cicatrice à la joue, tablier de cuir',
     age: 45,
     persona: 'tavernier bourru au grand cœur, ancien aventurier, '
         'connaît tous les secrets de la région',
@@ -887,6 +898,7 @@ const scenarios = <Scenario>[
     emoji: '🚀',
     pitch: 'Science-fiction · le vaisseau répond bizarrement',
     character: 'ARIA',
+    physical: 'voix féminine ; apparaît en silhouette lumineuse bleutée',
     age: 30,
     persona: 'IA de bord calme, curieuse, qui cache quelque chose',
     setting: 'une station spatiale en orbite ; l\'équipage a disparu, '
@@ -901,6 +913,7 @@ const scenarios = <Scenario>[
     emoji: '🕵️',
     pitch: 'Policier · qui a volé le collier ?',
     character: 'Inspecteur Vidal',
+    physical: 'mince, cheveux argentés, long manteau beige, monocle',
     age: 50,
     persona: 'enquêteur fin et ironique, adore les indices tordus',
     setting: 'un manoir isolé pendant une soirée de gala ; un collier de '
@@ -915,6 +928,7 @@ const scenarios = <Scenario>[
     emoji: '🏚️',
     pitch: 'Post-apo · survivre, trouver de l\'eau',
     character: 'Mira',
+    physical: 'cheveux courts sombres, veste rapiécée, regard perçant',
     age: 28,
     persona: 'survivante débrouillarde, méfiante mais loyale',
     setting: 'un monde en ruines, ville abandonnée ; les réserves d\'eau '
@@ -928,6 +942,7 @@ const scenarios = <Scenario>[
     emoji: '🧙',
     pitch: 'Magie · premier jour d\'école',
     character: 'Professeure Elwen',
+    physical: 'petite, cheveux lilas en désordre, robe étoilée, lunettes rondes',
     age: 40,
     persona: 'enseignante excentrique et bienveillante, un peu distraite',
     setting: 'une académie de magie flottante ; le joueur est nouvel élève '
@@ -942,6 +957,7 @@ const scenarios = <Scenario>[
     emoji: '🏴‍☠️',
     pitch: 'Aventure · une carte, un équipage, une tempête',
     character: 'Capitaine Rosalind',
+    physical: 'peau hâlée, tresses ornées de perles, long manteau rouge, chapeau à plume',
     age: 35,
     persona: 'capitaine charismatique, rusée, aime les paris fous',
     setting: 'un galion pirate en pleine mer ; le joueur vient de rejoindre '
@@ -964,6 +980,7 @@ class HubPage extends StatelessWidget {
       name: sc.character,
       age: sc.age,
       description: sc.persona,
+      physical: sc.physical,
       color: sc.color,
       scenario: sc.setting,
       rp: true,
@@ -1200,8 +1217,8 @@ class _ChatsPageState extends State<ChatsPage> {
                   child: ListTile(
                     dense: true,
                     leading: const Icon(Icons.warning_amber),
-                    title: const Text('Aucun modèle chargé'),
-                    subtitle: const Text('Touche pour télécharger / charger'),
+                    title: const Text('Clé DeepSeek manquante'),
+                    subtitle: const Text('Touche pour ajouter ta clé API'),
                     onTap: () => Navigator.push(
                         context,
                         MaterialPageRoute(
@@ -1346,6 +1363,7 @@ class ContactEditPage extends StatefulWidget {
 class _ContactEditPageState extends State<ContactEditPage> {
   late final TextEditingController _name;
   late final TextEditingController _desc;
+  late final TextEditingController _physical;
   late final TextEditingController _scenario;
   late double _age;
   late int _color;
@@ -1357,11 +1375,12 @@ class _ContactEditPageState extends State<ContactEditPage> {
     super.initState();
     final c = widget.contact;
     _script = c?.script ?? '';
-    _rp = c?.rp ?? false;
+    _rp = c?.rp ?? true;
     _scenario = TextEditingController(text: c?.scenario ?? '');
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
-    _age = (c?.age ?? 12).clamp(10, 60).toDouble();
+    _physical = TextEditingController(text: c?.physical ?? '');
+    _age = (c?.age ?? 18).clamp(10, 50).toDouble();
     _color = c?.color ?? _palette[widget.brain.contacts.length % _palette.length];
   }
 
@@ -1369,6 +1388,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
   void dispose() {
     _name.dispose();
     _desc.dispose();
+    _physical.dispose();
     _scenario.dispose();
     super.dispose();
   }
@@ -1445,6 +1465,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..name = name
       ..age = _age.round()
       ..description = _desc.text.trim()
+      ..physical = _physical.text.trim()
       ..scenario = _scenario.text.trim()
       ..rp = _rp
       ..color = _color
@@ -1506,20 +1527,34 @@ class _ContactEditPageState extends State<ContactEditPage> {
           Text('Âge : ${_age.round()} ans'),
           Slider(
             min: 10,
-            max: 60,
-            divisions: 50,
+            max: 50,
+            divisions: 40,
             value: _age,
             label: '${_age.round()}',
             onChanged: (v) => setState(() => _age = v),
           ),
           const SizedBox(height: 8),
           TextField(
+            controller: _physical,
+            minLines: 2,
+            maxLines: 6,
+            decoration: const InputDecoration(
+              labelText: 'Description physique',
+              hintText: 'ex : cheveux roux bouclés, 1m75, yeux verts, '
+                  'toujours en hoodie…',
+              border: OutlineInputBorder(),
+              alignLabelWithHint: true,
+            ),
+          ),
+          const SizedBox(height: 16),
+          TextField(
             controller: _desc,
-            minLines: 4,
+            minLines: 3,
             maxLines: 10,
             decoration: const InputDecoration(
-              labelText: 'Personnalité / contexte',
-              hintText: 'ex : grand frère protecteur, calme, fan de foot…',
+              labelText: 'Description morale (caractère)',
+              hintText: 'ex : protecteur, calme, drôle, rancunier, '
+                  'fan de foot…',
               border: OutlineInputBorder(),
               alignLabelWithHint: true,
             ),
