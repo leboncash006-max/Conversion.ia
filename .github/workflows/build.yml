@@ -22,17 +22,30 @@ jobs:
           flutter create ia_test --platforms=android
           cp main.dart ia_test/lib/main.dart
           cd ia_test
-          flutter pub add flutter_litert_lm path_provider file_picker:^10.0.0 flutter_tts:^4.2.0 speech_to_text:^7.0.0 sherpa_onnx:^1.13.8 audioplayers:^6.8.0 archive:^4.0.0
+          flutter pub add flutter_litert_lm path_provider file_picker:^10.0.0 flutter_local_notifications:^22.3.1 timezone flutter_tts:^4.2.0 speech_to_text:^7.0.0 sherpa_onnx:^1.13.8 audioplayers:^6.8.0 archive:^4.0.0
           sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          # Dictée et lecture à voix haute : services vocaux d'Android
           sed -i 's#<queries>#<queries>\n        <intent><action android:name="android.speech.RecognitionService"/></intent>\n        <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>#' android/app/src/main/AndroidManifest.xml
           grep -q RecognitionService android/app/src/main/AndroidManifest.xml
-          # Bibliothèques natives compressées dans l'APK (fichier bien plus léger)
-          if [ -f android/app/build.gradle.kts ]; then
-            printf '\nandroid {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n' >> android/app/build.gradle.kts
-          else
-            printf '\nandroid {\n    packagingOptions {\n        jniLibs {\n            useLegacyPackaging true\n        }\n    }\n}\n' >> android/app/build.gradle
-          fi
+          # Notifications programmées : recepteurs Android + desugaring Java
+          sed -i 's#</application>#<receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />\n        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/><action android:name="android.intent.action.MY_PACKAGE_REPLACED"/></intent-filter></receiver>\n    </application>#' android/app/src/main/AndroidManifest.xml
+          python3 - <<'PY'
+          import glob
+          for f in glob.glob('android/app/build.gradle*'):
+              t = open(f).read()
+              # Bibliothèques natives compressées : APK bien plus léger
+              if f.endswith('.kts'):
+                  t = t.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+                  t += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+                  t += '\nandroid {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n'
+              else:
+                  t = t.replace('compileOptions {', 'compileOptions {\n        coreLibraryDesugaringEnabled true', 1)
+                  t += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+                  t += '\nandroid {\n    packagingOptions {\n        jniLibs {\n            useLegacyPackaging true\n        }\n    }\n}\n'
+              open(f, 'w').write(t)
+              print('patched', f)
+          PY
       - name: Compiler
         run: |
           cd ia_test
