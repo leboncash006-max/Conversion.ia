@@ -137,7 +137,7 @@ class Contact {
     this.script = '',
     this.scenario = '',
     this.physical = '',
-    this.rp = true,
+    this.rp = false,
     List<Msg>? messages,
   }) : messages = messages ?? [];
 
@@ -174,7 +174,7 @@ class Contact {
         script: j['script'] as String? ?? '',
         physical: j['physical'] as String? ?? '',
         scenario: j['scenario'] as String? ?? '',
-        rp: j['rp'] as bool? ?? true,
+        rp: j['rp'] as bool? ?? false,
         messages: [
           for (final m in (j['messages'] as List? ?? const []))
             Msg.fromJson(Map<String, dynamic>.from(m as Map)),
@@ -412,6 +412,13 @@ class Brain extends ChangeNotifier {
         for (final c in (j['contacts'] as List? ?? const [])) {
           contacts.add(Contact.fromJson(Map<String, dynamic>.from(c as Map)));
         }
+        // Migration v2 : le mode narratif n'est plus le mode par défaut. Les
+        // contacts sans décor (créés à la main) repassent en style SMS.
+        if ((j['v'] as num?) == null) {
+          for (final c in contacts) {
+            if (c.rp && c.scenario.trim().isEmpty) c.rp = false;
+          }
+        }
       }
     } catch (_) {}
     if (contacts.isEmpty) {
@@ -437,6 +444,7 @@ class Brain extends ChangeNotifier {
       await _dataFile.writeAsString(jsonEncode({
         'modelId': modelId,
         'customRepo': customRepo,
+        'v': 2,
         'provider': provider,
         'apiKeys': apiKeys,
         'apiModels': apiModels,
@@ -685,17 +693,36 @@ class Brain extends ChangeNotifier {
           'qui lui laisse la main. 2 à 5 phrases par message. Tu restes '
           'dans l\'univers et tu gardes l\'histoire adaptée à tous.');
   } else {
+    final ctx = c.scenario.trim();
     buf
-    ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
-        '(style WhatsApp) avec ton ami(e).')
-    ..writeln('Ton physique : '
-        '${c.physical.trim().isEmpty ? 'non précisé' : c.physical.trim()}.')
-    ..writeln('Ton caractère : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
-    ..writeln('Tu écris en français, de façon naturelle et spontanée. '
-        'Messages courts (1 à 3 phrases), parfois un emoji. '
-        'Pas de narration, pas d\'astérisques, pas de didascalies.')
-    ..writeln('Tu restes toujours dans ton personnage et tu relances '
-        'de temps en temps la conversation avec une question.');
+      ..writeln('Tu es ${c.name}, ${c.age} ans. Tu échanges des messages '
+          '(WhatsApp / SMS) avec une personne, EXACTEMENT comme une vraie '
+          'personne de ${c.age} ans, pas comme une IA.')
+      ..writeln('Ton physique : '
+          '${c.physical.trim().isEmpty ? 'non précisé' : c.physical.trim()}. '
+          '(Tu n\'en parles que si le sujet arrive naturellement.)')
+      ..writeln('Ton caractère : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
+      ..writeln(ctx.isEmpty
+          ? 'Contexte : tu parles avec un(e) ami(e).'
+          : 'Contexte / relation : $ctx.')
+      ..writeln('')
+      ..writeln('RÈGLES STRICTES (à respecter à chaque message) :')
+      ..writeln('- Message très court : 1 phrase, 2 maximum, en général moins '
+          'de 15 mots. JAMAIS de paragraphe ni de longue explication.')
+      ..writeln('- Style texto naturel pour ${c.age} ans : peu de ponctuation, '
+          'minuscules acceptées, abréviations (slt, tkt, mdr, jsp, pq, cv, '
+          'pk, ptdr), emoji rare.')
+      ..writeln('- Tu réponds seulement à ce que la personne vient de dire. '
+          'Tu ne racontes pas ta vie, tu n\'inventes pas d\'histoire ni de '
+          'détails sauf si on te le demande.')
+      ..writeln('- Aucune narration, aucune action entre astérisques, aucune '
+          'description de scène, pas de guillemets.')
+      ..writeln('- Tu respectes ton caractère, ton âge et les infos ci-dessus '
+          'en permanence. Tu ne dis jamais que tu es une IA et tu ne sors '
+          'jamais du personnage.')
+      ..writeln('- Contenu tout public.')
+      ..writeln('Exemples de ton style : « slt » · « ça va et toi ? » · '
+          '« chui chez moi, et toi ? » · « mdr nan » · « jsp, pk ? »');
   }
   // Mémoire : on rejoue les derniers messages dans le contexte.
   final hist = c.messages.length > 14
@@ -961,11 +988,28 @@ class Brain extends ChangeNotifier {
   }
 
   void _addReply(Contact c, String? raw, Stopwatch sw) {
-    final clean = _clean(raw ?? '');
+    var clean = _clean(raw ?? '');
+    final secs = sw.elapsedMilliseconds / 1000;
+    if (!c.rp) {
+      // Messagerie : pas d'actions *entre astérisques*, et chaque ligne
+      // devient une bulle séparée, comme de vrais SMS.
+      clean = clean.replaceAll(RegExp(r'\*[^*]*\*'), '').trim();
+      final parts = [
+        for (final l in clean.split(RegExp(r'\n+')))
+          if (l.trim().isNotEmpty) l.trim(),
+      ];
+      if (parts.isNotEmpty) {
+        for (var i = 0; i < parts.length && i < 3; i++) {
+          c.messages.add(Msg(parts[i],
+              fromMe: false, seconds: i == 0 ? secs : null));
+        }
+        return;
+      }
+    }
     c.messages.add(Msg(
       clean.isEmpty ? '…' : clean,
       fromMe: false,
-      seconds: sw.elapsedMilliseconds / 1000,
+      seconds: secs,
     ));
   }
 
@@ -1130,7 +1174,6 @@ class HubPage extends StatelessWidget {
       age: 25,
       description: '',
       color: _palette[brain.contacts.length % _palette.length],
-      rp: true,
     );
     await Navigator.push(
         context,
@@ -1507,7 +1550,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
     super.initState();
     final c = widget.contact;
     _script = c?.script ?? '';
-    _rp = c?.rp ?? true;
+    _rp = c?.rp ?? false;
     _scenario = TextEditingController(text: c?.scenario ?? '');
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
@@ -1694,21 +1737,20 @@ class _ContactEditPageState extends State<ContactEditPage> {
           const SizedBox(height: 16),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('Mode jeu de rôle'),
-            subtitle: const Text('L\'IA narre, décrit les actions et mène '
-                'l\'histoire'),
+            title: const Text('Mode narratif'),
+            subtitle: const Text('Longs messages avec actions entre *astérisques* '
+                '(sinon : style SMS)'),
             value: _rp,
             onChanged: (v) => setState(() => _rp = v),
           ),
-          if (_rp)
-            TextField(
+          TextField(
               controller: _scenario,
               minLines: 3,
               maxLines: 8,
               decoration: const InputDecoration(
-                labelText: 'Décor / situation',
-                hintText: 'ex : une station spatiale abandonnée, '
-                    'le joueur vient de se réveiller…',
+                labelText: 'Contexte / relation (optionnel)',
+                hintText: 'ex : ton meilleur pote, vous êtes au lycée ; '
+                    'ou : sa grande sœur qui le surveille…',
                 border: OutlineInputBorder(),
                 alignLabelWithHint: true,
               ),
