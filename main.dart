@@ -11,12 +11,19 @@
 //    plusieurs messages d'affilée et temps d'écriture simulé
 //  - Relances spontanées, groupes de discussion, vocal (lecture +
 //    dictée), sauvegarde / restauration, recherche dans les messages
+//  - Messages vocaux de l'IA : voix neuronale hors ligne (ado 14-15 ans
+//    par défaut), expressive selon le ton de chaque phrase
 // ============================================================
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart' as arc;
+import 'package:audioplayers/audioplayers.dart';
 
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
@@ -24,6 +31,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_litert_lm/flutter_litert_lm.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 import 'package:speech_to_text/speech_to_text.dart';
 
 void main() => runApp(const MessengerApp());
@@ -135,6 +143,8 @@ class Contact {
     this.unread = 0,
     this.autoSpeak = false,
     this.pitch = 1.0,
+    this.vocal = true,
+    this.voice = 'ado',
     List<String>? members,
     List<String>? memory,
     List<Msg>? messages,
@@ -158,7 +168,9 @@ class Contact {
   int nudges; // relances envoyées depuis ton dernier message
   int unread; // messages non lus
   bool autoSpeak; // lecture à voix haute des nouveaux messages
-  double pitch; // hauteur de la voix (0.5 grave … 2 aiguë)
+  double pitch; // ancien réglage de voix (gardé pour compatibilité)
+  bool vocal; // peut envoyer des messages vocaux
+  String voice; // voix des vocaux (clé de voicePresets)
   List<String> memory; // souvenirs enregistrés par l'IA
   final List<Msg> messages;
 
@@ -180,6 +192,8 @@ class Contact {
         'unread': unread,
         'autoSpeak': autoSpeak,
         'pitch': pitch,
+        'vocal': vocal,
+        'voice': voice,
         'memory': memory,
         'messages': [for (final m in messages) m.toJson()],
       };
@@ -204,6 +218,8 @@ class Contact {
         unread: (j['unread'] as num?)?.toInt() ?? 0,
         autoSpeak: j['autoSpeak'] as bool? ?? false,
         pitch: (j['pitch'] as num?)?.toDouble() ?? 1.0,
+        vocal: j['vocal'] as bool? ?? true,
+        voice: j['voice'] as String? ?? 'ado',
         memory: [
           for (final m in (j['memory'] as List? ?? const [])) m.toString(),
         ],
@@ -216,13 +232,22 @@ class Contact {
 
 class Msg {
   Msg(this.text,
-      {required this.fromMe, DateTime? time, this.seconds, this.from})
+      {required this.fromMe,
+      DateTime? time,
+      this.seconds,
+      this.from,
+      this.audio,
+      this.dur,
+      this.wave})
       : time = time ?? DateTime.now();
-  final String text;
+  final String text; // pour un vocal : sa transcription
   final bool fromMe;
   final DateTime time;
   final double? seconds;
   final String? from; // dans un groupe : id du contact qui a écrit
+  final String? audio; // message vocal : fichier .wav dans le dossier de l'app
+  final int? dur; // durée du vocal (ms)
+  final List<double>? wave; // forme d'onde du vocal
 
   Map<String, dynamic> toJson() => {
         't': text,
@@ -230,6 +255,10 @@ class Msg {
         'ts': time.millisecondsSinceEpoch,
         if (seconds != null) 's': seconds,
         if (from != null) 'f': from,
+        if (audio != null) 'a': audio,
+        if (dur != null) 'd': dur,
+        if (wave != null)
+          'w': [for (final w in wave!) (w * 100).round()],
       };
 
   static Msg fromJson(Map<String, dynamic> j) => Msg(
@@ -238,6 +267,11 @@ class Msg {
         time: DateTime.fromMillisecondsSinceEpoch((j['ts'] as num?)?.toInt() ?? 0),
         seconds: (j['s'] as num?)?.toDouble(),
         from: j['f'] as String?,
+        audio: j['a'] as String?,
+        dur: (j['d'] as num?)?.toInt(),
+        wave: j['w'] == null
+            ? null
+            : [for (final w in j['w'] as List) (w as num) / 100],
       );
 }
 
@@ -386,15 +420,49 @@ String _dayLabel(DateTime t) {
 // ---------------------------------------------------------------
 //  Voix : lecture à voix haute (TTS) et dictée (reconnaissance vocale)
 // ---------------------------------------------------------------
+// Voix proposées pour les vocaux : (nom, demi-tons, débit).
+const voicePresets = <String, (String, double, double)>{
+  'ado': ('Ado · fille 14-15 ans', 2.5, 1.08),
+  'jeune': ('Jeune femme', 0.8, 1.02),
+  'douce': ('Douce et posée', 1.5, 0.92),
+  'grave': ('Plus grave', -1.5, 0.98),
+};
+
+const voiceModelUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/'
+    'download/tts-models/vits-piper-fr_FR-siwis-medium.tar.bz2';
+
 class Voice {
   static final FlutterTts _tts = FlutterTts();
   static final SpeechToText stt = SpeechToText();
   static bool _ttsReady = false;
   static Future<void> _queue = Future.value();
+  static Future<void> _synthQueue = Future.value();
+  static int _gen = 0; // incrémenté par stop() : vide la file
+  static int _tmp = 0;
 
-  static final _emoji = RegExp(
-      r'[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]',
-      unicode: true);
+  static String get modelDir => '$_appDirPath/vits-piper-$voiceModelName';
+
+  /// La voix neuronale (vocaux réalistes) est installée.
+  static bool get neuralReady =>
+      _appDirPath.isNotEmpty &&
+      File('$modelDir/$voiceModelName.onnx').existsSync() &&
+      File('$modelDir/tokens.txt').existsSync() &&
+      Directory('$modelDir/espeak-ng-data').existsSync();
+
+  /// Fabrique un vocal (dans un isolate, un à la fois).
+  static Future<({int ms, List<double> wave})> synth(
+      String text, String outPath, String preset) {
+    final (_, semi, speed) = voicePresets[preset] ?? voicePresets['ado']!;
+    final dir = modelDir;
+    final run = _synthQueue.then((_) => Isolate.run(() => synthVoiceFile(
+        modelDir: dir,
+        text: text,
+        outPath: outPath,
+        semi: semi,
+        speed: speed)));
+    _synthQueue = run.then((_) {}, onError: (_) {});
+    return run;
+  }
 
   static Future<void> _init() async {
     if (_ttsReady) return;
@@ -404,24 +472,348 @@ class Voice {
     await _tts.awaitSpeakCompletion(true);
   }
 
-  /// Ajoute un message à la file de lecture.
-  static void speak(String text, {double pitch = 1.0}) {
-    final clean = text.replaceAll(_emoji, '').trim();
+  /// Lit un message à voix haute avec la voix du contact (file d'attente).
+  static void speak(String text, Contact who) {
+    final clean = text.replaceAll(_emojiRe, '').trim();
     if (clean.isEmpty) return;
+    final g = _gen;
     _queue = _queue.then((_) async {
+      if (g != _gen) return;
       try {
-        await _init();
-        await _tts.setPitch(pitch);
-        await _tts.speak(clean);
+        if (neuralReady) {
+          final path = '$_appDirPath/lecture_${_tmp++ % 3}.wav';
+          await synth(text, path, who.voice);
+          if (g != _gen) return;
+          await AudioHub.i.playAndWait(path);
+        } else {
+          final semi = (voicePresets[who.voice] ?? voicePresets['ado']!).$2;
+          await _init();
+          await _tts.setPitch(pow(2, semi / 12).toDouble());
+          await _tts.speak(clean);
+        }
       } catch (_) {}
     });
   }
 
   static Future<void> stop() async {
+    _gen++;
     _queue = Future.value();
+    await AudioHub.i.stop();
     try {
       await _tts.stop();
     } catch (_) {}
+  }
+}
+
+/// Lecteur audio partagé (un seul son à la fois).
+class AudioHub extends ChangeNotifier {
+  AudioHub._() {
+    _p.onPositionChanged.listen((d) {
+      pos = d;
+      notifyListeners();
+    });
+    _p.onDurationChanged.listen((d) {
+      dur = d;
+      notifyListeners();
+    });
+    _p.onPlayerComplete.listen((_) => _finish());
+  }
+  static final i = AudioHub._();
+
+  final AudioPlayer _p = AudioPlayer();
+  String? path;
+  bool playing = false;
+  Duration pos = Duration.zero;
+  Duration dur = Duration.zero;
+  Completer<void>? _done;
+
+  void _finish() {
+    playing = false;
+    path = null;
+    pos = Duration.zero;
+    _done?.complete();
+    _done = null;
+    notifyListeners();
+  }
+
+  Future<void> toggle(String file) async {
+    if (path == file) {
+      if (playing) {
+        await _p.pause();
+      } else {
+        await _p.resume();
+      }
+      playing = !playing;
+      notifyListeners();
+      return;
+    }
+    await play(file);
+  }
+
+  Future<void> play(String file, {Duration? from}) async {
+    _done?.complete();
+    _done = null;
+    path = file;
+    pos = from ?? Duration.zero;
+    dur = Duration.zero;
+    playing = true;
+    notifyListeners();
+    await _p.play(DeviceFileSource(file), position: from);
+  }
+
+  Future<void> seek(String file, double fraction, int totalMs) async {
+    final at = Duration(milliseconds: (totalMs * fraction).round());
+    if (path != file) {
+      await play(file, from: at);
+    } else {
+      await _p.seek(at);
+      pos = at;
+      notifyListeners();
+    }
+  }
+
+  Future<void> playAndWait(String file) async {
+    final c = Completer<void>();
+    await play(file);
+    _done = c;
+    await c.future;
+  }
+
+  Future<void> stop() async {
+    if (path == null && !playing) return;
+    try {
+      await _p.stop();
+    } catch (_) {}
+    _finish();
+  }
+}
+
+// ---------------------------------------------------------------
+//  Messages vocaux : voix neuronale hors ligne (Piper « siwis »,
+//  via sherpa-onnx), rajeunie et rendue expressive phrase par phrase.
+// ---------------------------------------------------------------
+const voiceModelName = 'fr_FR-siwis-medium';
+
+enum _Tone { neutre, joie, triste, question, colere }
+
+final _laughRe = RegExp(r'\b(x?p?tdr+|mdr+|lol|ha(ha)+|hi(hi)+)\b',
+    caseSensitive: false);
+final _emojiRe = RegExp(
+    r'[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}\u{2764}]',
+    unicode: true);
+
+// Langage SMS → ce qu'on dirait à l'oral.
+const _spokenWords = {
+  'jsp': 'je sais pas',
+  'jpp': "j'en peux plus",
+  'tkt': "t'inquiète",
+  'pk': 'pourquoi',
+  'pq': 'pourquoi',
+  'bcp': 'beaucoup',
+  'stp': "s'il te plaît",
+  'svp': "s'il te plaît",
+  'dsl': 'désolée',
+  'slt': 'salut',
+  'cc': 'coucou',
+  'wsh': 'wesh',
+  'mtn': 'maintenant',
+  'tjr': 'toujours',
+  'tjrs': 'toujours',
+  'jtm': "je t'aime",
+  'oklm': 'au calme',
+  'pcq': 'parce que',
+  'psk': 'parce que',
+  'qd': 'quand',
+  'rdv': 'rendez-vous',
+  'auj': "aujourd'hui",
+  'ajd': "aujourd'hui",
+  'bjr': 'bonjour',
+  'bsr': 'bonsoir',
+  'vrmt': 'vraiment',
+  'chui': 'chuis',
+  'nn': 'non',
+  'ok': 'okay',
+};
+
+_Tone _toneOf(String s) {
+  final t = s.toLowerCase().trimRight();
+  final letters = s.replaceAll(RegExp(r'[^A-Za-zÀ-ÿ]'), '');
+  if (RegExp(r'😡|🤬|😤|énervée?|saoulée?|j.en ai marre').hasMatch(t) ||
+      (letters.length > 5 && letters == letters.toUpperCase())) {
+    return _Tone.colere;
+  }
+  if (RegExp(r'😢|😭|😔|😞|🥺|💔|triste|désolée?|\bdsl\b|fatiguée?|snif|déprim')
+          .hasMatch(t) ||
+      t.endsWith('…') ||
+      t.endsWith('...')) {
+    return _Tone.triste;
+  }
+  if (_laughRe.hasMatch(t) ||
+      RegExp(r'😂|🤣|😍|🥰|😁|😆|😄|🤩|❤|trop bien|génial|trop cool|\bouf\b')
+          .hasMatch(t) ||
+      t.endsWith('!')) {
+    return _Tone.joie;
+  }
+  if (t.endsWith('?')) return _Tone.question;
+  return _Tone.neutre;
+}
+
+String _spoken(String s) {
+  var t = s.replaceAll(_emojiRe, ' ').replaceAll(_laughRe, ' ');
+  t = t.replaceAllMapped(RegExp(r"[A-Za-zÀ-ÿ']+"), (m) {
+    final w = m.group(0)!;
+    return _spokenWords[w.toLowerCase()] ?? w;
+  });
+  return t
+      .replaceAll(RegExp(r'[*#_~<>\[\]]'), ' ')
+      .replaceAll(RegExp(r'([!?])\1+'), r'$1')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+}
+
+// Rééchantillonne [x] d'un facteur [p] (p > 1 : voix plus aiguë et plus
+// rapide), avec une montée finale pour les questions.
+void _shiftInto(List<double> out, Float32List x, double p, double gain,
+    {bool rise = false, int fade = 180}) {
+  final n = x.length;
+  final start = out.length;
+  var pos = 0.0;
+  while (pos < n - 1) {
+    final i = pos.floor();
+    final f = pos - i;
+    out.add((x[i] * (1 - f) + x[i + 1] * f) * gain);
+    final t = pos / n;
+    pos += rise && t > 0.65 ? p * pow(2, (t - 0.65) / 0.35 * 2.5 / 12) : p;
+  }
+  final len = out.length - start;
+  final fl = min(fade, len ~/ 2);
+  for (var k = 0; k < fl; k++) {
+    final g = k / fl;
+    out[start + k] *= g;
+    out[out.length - 1 - k] *= g;
+  }
+}
+
+/// Crée le fichier WAV d'un message vocal. [semi] : demi-tons ajoutés à la
+/// voix de base (≈ +2,5 pour une ado de 14-15 ans), [speed] : débit.
+/// Renvoie la durée et une forme d'onde (48 barres entre 0 et 1).
+/// Fonction synchrone et lourde : à lancer dans un isolate.
+({int ms, List<double> wave}) synthVoiceFile({
+  required String modelDir,
+  required String text,
+  required String outPath,
+  double semi = 2.5,
+  double speed = 1.08,
+}) {
+  sherpa.initBindings();
+  final tts = sherpa.OfflineTts(sherpa.OfflineTtsConfig(
+    model: sherpa.OfflineTtsModelConfig(
+      vits: sherpa.OfflineTtsVitsModelConfig(
+        model: '$modelDir/$voiceModelName.onnx',
+        tokens: '$modelDir/tokens.txt',
+        dataDir: '$modelDir/espeak-ng-data',
+      ),
+      numThreads: 2,
+      debug: false,
+    ),
+  ));
+  try {
+    final rng = Random();
+    // Découpage en phrases, chacune avec son ton.
+    final segs = <(String, _Tone)>[];
+    for (final m in RegExp(r'[^.!?…]+[.!?…]*').allMatches(text)) {
+      final raw = m.group(0)!.trim();
+      if (raw.isEmpty) continue;
+      final tone = _toneOf(raw);
+      final say = _spoken(raw);
+      if (!RegExp(r'[A-Za-zÀ-ÿ0-9]').hasMatch(say)) {
+        // Juste un emoji ou un rire : il colore la phrase d'avant.
+        if (segs.isNotEmpty && segs.last.$2 == _Tone.neutre) {
+          segs.last = (segs.last.$1, tone);
+        }
+        continue;
+      }
+      segs.add((say, tone));
+    }
+    if (segs.isEmpty) throw Exception('rien à dire');
+    var sr = 22050;
+    final out = <double>[];
+    var first = true;
+    for (final (say, tone) in segs) {
+      final (dSemi, dSpeed, gain) = switch (tone) {
+        _Tone.joie => (1.5, 1.12, 1.1),
+        _Tone.triste => (-1.2, 0.86, 0.85),
+        _Tone.question => (0.6, 1.0, 1.0),
+        _Tone.colere => (0.3, 1.12, 1.2),
+        _Tone.neutre => (0.0, 1.0, 1.0),
+      };
+      final p = pow(2, (semi + dSemi + (rng.nextDouble() - 0.5) * 0.6) / 12)
+          .toDouble();
+      final a = tts.generate(text: say, sid: 0, speed: speed * dSpeed / p);
+      sr = a.sampleRate;
+      if (first) {
+        out.addAll(List.filled((sr * 0.15).round(), 0.0));
+        first = false;
+      }
+      _shiftInto(out, a.samples, p, gain, rise: tone == _Tone.question);
+      final pause = switch (tone) {
+            _Tone.triste => 0.5,
+            _Tone.question => 0.3,
+            _ => 0.22,
+          } +
+          rng.nextDouble() * 0.12;
+      out.addAll(List.filled((sr * pause).round(), 0.0));
+    }
+    var peak = 0.0;
+    for (final v in out) {
+      peak = max(peak, v.abs());
+    }
+    final k = peak > 0 ? 0.9 / peak : 1.0;
+    // WAV 16 bits mono.
+    final data = ByteData(44 + out.length * 2);
+    void str(int o, String s) {
+      for (var i = 0; i < s.length; i++) {
+        data.setUint8(o + i, s.codeUnitAt(i));
+      }
+    }
+
+    str(0, 'RIFF');
+    data.setUint32(4, 36 + out.length * 2, Endian.little);
+    str(8, 'WAVEfmt ');
+    data.setUint32(16, 16, Endian.little);
+    data.setUint16(20, 1, Endian.little);
+    data.setUint16(22, 1, Endian.little);
+    data.setUint32(24, sr, Endian.little);
+    data.setUint32(28, sr * 2, Endian.little);
+    data.setUint16(32, 2, Endian.little);
+    data.setUint16(34, 16, Endian.little);
+    str(36, 'data');
+    data.setUint32(40, out.length * 2, Endian.little);
+    for (var i = 0; i < out.length; i++) {
+      data.setInt16(44 + i * 2,
+          (out[i] * k * 32767).round().clamp(-32768, 32767), Endian.little);
+    }
+    File(outPath).writeAsBytesSync(data.buffer.asUint8List());
+    // Forme d'onde pour la bulle.
+    const bars = 48;
+    final wave = <double>[];
+    final step = max(1, out.length ~/ bars);
+    for (var b = 0; b < bars; b++) {
+      var s = 0.0;
+      final from = b * step;
+      final to = min(out.length, from + step);
+      for (var i = from; i < to; i++) {
+        s += out[i] * out[i];
+      }
+      wave.add(to > from ? sqrt(s / (to - from)) * k : 0);
+    }
+    final top = wave.fold<double>(0, max);
+    return (
+      ms: out.length * 1000 ~/ sr,
+      wave: [for (final w in wave) top > 0 ? (w / top).clamp(0.08, 1.0) : 0.08],
+    );
+  } finally {
+    tts.free();
   }
 }
 
@@ -450,6 +842,11 @@ class Brain extends ChangeNotifier {
   final Set<String> generating = {};
   // Dans un groupe : nom du membre en train d'écrire.
   final Map<String, String> typingName = {};
+  // Discussions où l'IA est en train d'enregistrer un vocal.
+  final Set<String> recording = {};
+  // Installation de la voix des vocaux.
+  double? voiceProgress;
+  String voiceStatus = '';
   // Incrémenté quand une discussion est vidée : stoppe une rafale en cours.
   final Map<String, int> _epoch = {};
   // Une seule génération à la fois sur le moteur.
@@ -570,6 +967,7 @@ class Brain extends ChangeNotifier {
     await Voice.stop();
     for (final c in contacts) {
       _bump(c);
+      _dropAudio(c.messages);
       if (!photos.containsKey(c.photo)) _deletePhoto(c.photo);
     }
     for (final c in _convs.values) {
@@ -601,7 +999,15 @@ class Brain extends ChangeNotifier {
     notifyListeners();
   }
 
+  // Supprime les fichiers audio des messages retirés.
+  void _dropAudio(Iterable<Msg> msgs) {
+    for (final m in msgs) {
+      if (m.audio != null) _deletePhoto(m.audio);
+    }
+  }
+
   void deleteContact(Contact c) {
+    _dropAudio(c.messages);
     contacts.remove(c);
     for (final g in contacts) {
       g.members.remove(c.id);
@@ -614,6 +1020,7 @@ class Brain extends ChangeNotifier {
   }
 
   void clearChat(Contact c) {
+    _dropAudio(c.messages);
     c.messages.clear();
     _bump(c);
     _dropConv(c.id);
@@ -799,6 +1206,81 @@ class Brain extends ChangeNotifier {
     await refreshDownloaded();
   }
 
+  // ----- Voix des messages vocaux -----
+  Future<void> downloadVoice() async {
+    if (voiceProgress != null) return;
+    voiceProgress = 0;
+    voiceStatus = 'Téléchargement de la voix…';
+    notifyListeners();
+    final archive = File('${_dir.path}/voix.tar.bz2');
+    final client = HttpClient();
+    try {
+      final res = await (await client.getUrl(Uri.parse(voiceModelUrl))).close();
+      if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
+      final total = res.contentLength > 0 ? res.contentLength : 67207459;
+      final sink = archive.openWrite();
+      var got = 0;
+      var lastPct = -1;
+      await for (final chunk in res) {
+        sink.add(chunk);
+        got += chunk.length;
+        final pct = got * 100 ~/ total;
+        if (pct != lastPct) {
+          lastPct = pct;
+          voiceProgress = min(1, got / total) * 0.8;
+          voiceStatus = 'Téléchargement de la voix… '
+              '${(got / 1e6).toStringAsFixed(0)} Mo';
+          notifyListeners();
+        }
+      }
+      await sink.close();
+      voiceProgress = 0.85;
+      voiceStatus = 'Installation de la voix (≈ 1 min)…';
+      notifyListeners();
+      final src = archive.path;
+      final dest = _dir.path;
+      await Isolate.run(() {
+        final tar = arc.BZip2Decoder().decodeBytes(File(src).readAsBytesSync());
+        for (final f in arc.TarDecoder().decodeBytes(tar)) {
+          if (!f.isFile || f.name.contains('..')) continue;
+          File('$dest/${f.name}')
+            ..createSync(recursive: true)
+            ..writeAsBytesSync(f.content);
+        }
+      });
+      if (!Voice.neuralReady) throw Exception('fichiers de voix incomplets');
+      // Les consignes changent (vocaux possibles) : on recrée les discussions.
+      for (final c in _convs.values) {
+        await c.dispose();
+      }
+      _convs.clear();
+      voiceStatus = 'Voix installée ✅ : les contacts peuvent envoyer des vocaux.';
+    } catch (e) {
+      voiceStatus = 'Erreur d\'installation de la voix : $e';
+    } finally {
+      client.close();
+      try {
+        if (await archive.exists()) await archive.delete();
+      } catch (_) {}
+      voiceProgress = null;
+      notifyListeners();
+    }
+  }
+
+  Future<void> deleteVoice() async {
+    await Voice.stop();
+    try {
+      final d = Directory(Voice.modelDir);
+      if (await d.exists()) await d.delete(recursive: true);
+    } catch (_) {}
+    for (final c in _convs.values) {
+      await c.dispose();
+    }
+    _convs.clear();
+    voiceStatus = 'Voix supprimée';
+    notifyListeners();
+  }
+
   // ----- Chargement -----
   Future<void> unload() async {
     for (final c in _convs.values) {
@@ -861,6 +1343,13 @@ class Brain extends ChangeNotifier {
       buf.writeln('Comme sur WhatsApp, tu peux envoyer plusieurs messages '
           'd\'affilée quand c\'est naturel : sépare alors chaque message par '
           'une ligne contenant uniquement ---. Pas plus de 4 messages.');
+    }
+    if (c.vocal && Voice.neuralReady) {
+      buf.writeln('Tu peux aussi envoyer des messages vocaux, comme sur '
+          'WhatsApp : quand tu en as envie (raconter un truc, réagir avec '
+          'émotion, quand tu as la flemme d\'écrire, ou si on te le demande), '
+          'commence ce message par [VOCAL] puis écris exactement ce que tu '
+          'dis à l\'oral, avec ton ton et tes émotions. Pas à chaque fois.');
     }
     if (c.memoryOn) {
       buf.writeln('Mémoire : quand ton ami(e) te dit quelque chose d\'important '
@@ -1027,6 +1516,7 @@ class Brain extends ChangeNotifier {
     } finally {
       generating.remove(c.id);
       typingName.remove(c.id);
+      recording.remove(c.id);
       notifyListeners();
       _scheduleSave();
     }
@@ -1135,7 +1625,7 @@ class Brain extends ChangeNotifier {
   Future<void> regenerate(Contact c) async {
     if (generating.contains(c.id) || !canReply(c)) return;
     while (c.messages.isNotEmpty && !c.messages.last.fromMe) {
-      c.messages.removeLast();
+      _dropAudio([c.messages.removeLast()]);
     }
     if (c.messages.isEmpty) return;
     final last = c.messages.removeLast();
@@ -1146,6 +1636,7 @@ class Brain extends ChangeNotifier {
   void deleteMessage(Contact c, Msg m) {
     if (generating.contains(c.id)) return;
     c.messages.remove(m);
+    _dropAudio([m]);
     _dropConv(c.id);
     _scheduleSave();
     notifyListeners();
@@ -1155,6 +1646,7 @@ class Brain extends ChangeNotifier {
     if (generating.contains(c.id) || !canReply(c)) return;
     final i = c.messages.indexOf(m);
     if (i < 0) return;
+    _dropAudio(c.messages.sublist(i));
     c.messages.removeRange(i, c.messages.length);
     _dropConv(c.id);
     await send(c, text);
@@ -1209,9 +1701,13 @@ class Brain extends ChangeNotifier {
 
   static final _sepRe = RegExp(r'^\s*(?:-{3,}|\|{3})\s*$', multiLine: true);
 
+  // Découpe en bulles ; un [VOCAL] au milieu d'un message en démarre un
+  // nouveau (le texte avant part écrit, la suite part en vocal).
   List<String> _split(String text) => [
         for (final p in text.split(_sepRe))
-          if (p.trim().isNotEmpty) p.trim(),
+          for (final q in p.split(
+              RegExp(r'(?=\[\s*vocal\s*\])', caseSensitive: false)))
+            if (q.trim().isNotEmpty) q.trim(),
       ];
 
   // Temps qu'aurait mis une personne à taper ce message.
@@ -1221,6 +1717,51 @@ class Brain extends ChangeNotifier {
     return Duration(milliseconds: ms.clamp(700, 30000));
   }
 
+  static final _vocalRe =
+      RegExp(r'^\s*\[\s*vocal\s*\]', caseSensitive: false);
+  static final _vocalTagRe =
+      RegExp(r'\[\s*vocal\s*\]\s*:?\s*', caseSensitive: false);
+
+  /// L'IA « enregistre » un vocal : l'audio est fabriqué, puis on attend à
+  /// peu près sa durée (le temps de parler) avant de l'envoyer.
+  /// Renvoie false si la voix a échoué (le message part alors en texte).
+  Future<bool> _sendVocal(Contact c, String text, Stopwatch sw, int epoch,
+      bool first, Contact? author) async {
+    final who = author ?? c;
+    recording.add(c.id);
+    notifyListeners();
+    final sw2 = Stopwatch()..start();
+    final name = 'vocal_${DateTime.now().microsecondsSinceEpoch}.wav';
+    try {
+      final r = await Voice.synth(text, '$_appDirPath/$name', who.voice);
+      if (typingCps > 0) {
+        var wait = Duration(milliseconds: min(r.ms, 60000)) - sw2.elapsed;
+        if (first) wait -= sw.elapsed;
+        if (wait > Duration.zero) await Future<void>.delayed(wait);
+      }
+      if ((_epoch[c.id] ?? 0) != epoch || !contacts.contains(c)) {
+        _deletePhoto(name);
+        return true;
+      }
+      c.messages.add(Msg(text,
+          fromMe: false,
+          from: author?.id,
+          audio: name,
+          dur: r.ms,
+          wave: r.wave,
+          seconds: first ? sw.elapsedMilliseconds / 1000 : null));
+      if (openChatId != c.id) c.unread++;
+      _scheduleSave();
+      return true;
+    } catch (_) {
+      _deletePhoto(name);
+      return false;
+    } finally {
+      recording.remove(c.id);
+      notifyListeners();
+    }
+  }
+
   Future<void> _deliver(Contact c, String raw, Stopwatch sw, int epoch,
       {bool timed = true, Contact? author}) async {
     final who = author ?? c; // dans un groupe : le membre qui écrit
@@ -1228,15 +1769,26 @@ class Brain extends ChangeNotifier {
     final memBefore = who.memory.length;
     final text = _extractMemory(who, _clean(raw));
     var parts = _split(text);
-    if (!who.multi && parts.length > 1) parts = [parts.join('\n\n')];
+    if (!who.multi && parts.length > 1 && !parts.any(_vocalRe.hasMatch)) {
+      parts = [parts.join('\n\n')];
+    }
     if (parts.isEmpty) parts = ['…'];
     if (who.memory.length != memBefore) _scheduleSave();
     for (var i = 0; i < parts.length; i++) {
-      final p = parts[i];
+      var p = parts[i];
+      final isVocal = _vocalRe.hasMatch(p);
+      p = p.replaceAll(_vocalTagRe, '').trim();
+      if (p.isEmpty) continue;
       if (i > 0) {
         // Petite pause entre deux messages, comme une vraie personne.
         await Future<void>.delayed(
             Duration(milliseconds: 400 + _rng.nextInt(700)));
+      }
+      if (isVocal &&
+          who.vocal &&
+          Voice.neuralReady &&
+          await _sendVocal(c, p, sw, epoch, i == 0, author)) {
+        continue;
       }
       // Le temps de génération compte déjà comme temps d'écriture.
       var wait = _typingTime(p);
@@ -1252,7 +1804,7 @@ class Brain extends ChangeNotifier {
       if (openChatId != c.id) {
         c.unread++;
       } else if (c.autoSpeak) {
-        Voice.speak(p, pitch: who.pitch);
+        Voice.speak(p, who);
       }
       notifyListeners();
       _scheduleSave();
@@ -1549,16 +2101,20 @@ class _ChatsPageState extends State<ChatsPage> {
                       ]),
                       subtitle: Text(
                         typing
-                            ? (who != null
-                                ? '$who est en train d\'écrire…'
-                                : 'en train d\'écrire…')
+                            ? (brain.recording.contains(c.id)
+                                ? '🎤 ${who != null ? '$who ' : ''}enregistre un audio…'
+                                : who != null
+                                    ? '$who est en train d\'écrire…'
+                                    : 'en train d\'écrire…')
                             : (last == null
                                 ? (c.isGroup
                                     ? brain.membersOf(c)
                                         .map((m) => m.name)
                                         .join(', ')
                                     : 'Dis bonjour 👋')
-                                : '$author${last.text}'),
+                                : last.audio != null
+                                    ? '$author🎤 Message vocal (${_mmss(last.dur ?? 0)})'
+                                    : '$author${last.text}'),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
@@ -1739,14 +2295,16 @@ class _ContactEditPageState extends State<ContactEditPage> {
   bool _multi = true;
   bool _memoryOn = true;
   bool _nudge = true;
-  double _pitch = 1.0;
+  bool _vocal = true;
+  String _voice = 'ado';
 
   @override
   void initState() {
     super.initState();
     final c = widget.contact;
     _nudge = c?.nudge ?? true;
-    _pitch = c?.pitch ?? 1.0;
+    _vocal = c?.vocal ?? true;
+    _voice = c?.voice ?? 'ado';
     _script = c?.script ?? '';
     _photo = _origPhoto = c?.photo;
     _length = c?.length ?? 1;
@@ -1888,7 +2446,8 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..multi = _multi
       ..memoryOn = _memoryOn
       ..nudge = _nudge
-      ..pitch = _pitch
+      ..vocal = _vocal
+      ..voice = _voice
       ..memory = [
         for (final l in _memory.text.split('\n'))
           if (l.trim().isNotEmpty) l.trim(),
@@ -2024,31 +2583,46 @@ class _ContactEditPageState extends State<ContactEditPage> {
                     value: _nudge,
                     onChanged: (v) => setState(() => _nudge = v),
                   ),
-                  const SizedBox(height: 4),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Envoie des messages vocaux'),
+                    subtitle: Text(Voice.neuralReady
+                        ? 'Il/elle décide quand envoyer un vocal'
+                        : 'Installe d\'abord la voix dans « Modèles IA »'),
+                    value: _vocal,
+                    onChanged: (v) => setState(() => _vocal = v),
+                  ),
                   Row(children: [
-                    const Text('Voix'),
+                    const Text('Voix '),
+                    const SizedBox(width: 8),
                     Expanded(
-                      child: Slider(
-                        min: 0.5,
-                        max: 2.0,
-                        divisions: 15,
-                        value: _pitch,
-                        label: _pitch < 0.9
-                            ? 'grave'
-                            : _pitch > 1.2
-                                ? 'aiguë'
-                                : 'normale',
-                        onChanged: (v) => setState(() => _pitch = v),
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        value: voicePresets.containsKey(_voice) ? _voice : 'ado',
+                        items: [
+                          for (final e in voicePresets.entries)
+                            DropdownMenuItem(
+                                value: e.key, child: Text(e.value.$1)),
+                        ],
+                        onChanged: (v) => setState(() => _voice = v ?? 'ado'),
                       ),
                     ),
                     IconButton(
                       tooltip: 'Tester la voix',
                       icon: const Icon(Icons.volume_up),
                       onPressed: () {
+                        final who = Contact(
+                            id: '_test',
+                            name: _name.text,
+                            age: _age.round(),
+                            description: '',
+                            color: _color,
+                            voice: _voice);
                         Voice.stop();
                         Voice.speak(
-                            'Salut, c\'est ${_name.text.trim().isEmpty ? 'moi' : _name.text.trim()} !',
-                            pitch: _pitch);
+                            'Coucou ! C\'est ${_name.text.trim().isEmpty ? 'moi' : _name.text.trim()}. '
+                            'Ça va toi ? Moi trop bien !',
+                            who);
                       },
                     ),
                   ]),
@@ -2488,7 +3062,8 @@ class _ChatPageState extends State<ChatPage> {
         final who = m.fromMe ? 'Toi' : (brain.byId(m.from) ?? c).name;
         final t = m.time;
         return ListTile(
-          title: Text(m.text, maxLines: 2, overflow: TextOverflow.ellipsis),
+          title: Text('${m.audio != null ? '🎤 ' : ''}${m.text}',
+              maxLines: 2, overflow: TextOverflow.ellipsis),
           subtitle: Text('$who · ${t.day.toString().padLeft(2, '0')}/'
               '${t.month.toString().padLeft(2, '0')} ${_hhmm(t)}'),
           onTap: () => _jumpTo(m),
@@ -2569,9 +3144,13 @@ class _ChatPageState extends State<ChatPage> {
                         style: const TextStyle(fontSize: 17)),
                     Text(
                         typing
-                            ? (brain.typingName[c.id] != null
-                                ? '${brain.typingName[c.id]} écrit…'
-                                : 'en train d\'écrire…')
+                            ? (brain.recording.contains(c.id)
+                                ? (brain.typingName[c.id] != null
+                                    ? '${brain.typingName[c.id]} enregistre un audio…'
+                                    : 'enregistre un audio…')
+                                : brain.typingName[c.id] != null
+                                    ? '${brain.typingName[c.id]} écrit…'
+                                    : 'en train d\'écrire…')
                             : (c.isGroup
                                 ? brain.membersOf(c).map((m) => m.name).join(', ')
                                 : 'en ligne'),
@@ -2781,14 +3360,14 @@ class _ChatPageState extends State<ChatPage> {
                   duration: Duration(seconds: 1)));
             },
           ),
-          if (!m.fromMe)
+          if (!m.fromMe && m.audio == null)
             ListTile(
               leading: const Icon(Icons.volume_up),
               title: const Text('Écouter'),
               onTap: () {
                 Navigator.pop(ctx);
                 Voice.stop();
-                Voice.speak(m.text, pitch: (brain.byId(m.from) ?? c).pitch);
+                Voice.speak(m.text, brain.byId(m.from) ?? c);
               },
             ),
           if (m.fromMe)
@@ -2904,10 +3483,18 @@ class _ChatPageState extends State<ChatPage> {
           decoration: BoxDecoration(
               color: _dark(context) ? const Color(0xFF202C33) : Colors.white,
               borderRadius: BorderRadius.circular(12)),
-          child: const SizedBox(
-              width: 24,
-              height: 14,
-              child: LinearProgressIndicator(minHeight: 3)),
+          child: brain.recording.contains(c.id)
+              ? const Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.mic, color: Colors.red, size: 18),
+                  SizedBox(width: 6),
+                  Text('enregistre un audio…',
+                      style: TextStyle(
+                          fontSize: 13, fontStyle: FontStyle.italic)),
+                ])
+              : const SizedBox(
+                  width: 24,
+                  height: 14,
+                  child: LinearProgressIndicator(minHeight: 3)),
         ),
       );
 
@@ -2956,6 +3543,10 @@ class _ChatPageState extends State<ChatPage> {
                             color: Color(author?.color ?? 0xFF888888))),
                   ),
                 ),
+              if (m.audio != null)
+                VoiceBubble(
+                    msg: m, who: author ?? c, dark: _dark(context))
+              else
               Align(
                   alignment: Alignment.centerLeft,
                   child: Text(m.text,
@@ -2977,6 +3568,130 @@ class _ChatPageState extends State<ChatPage> {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------
+//  Bulle de message vocal
+// ---------------------------------------------------------------
+String _mmss(int ms) {
+  final s = (ms / 1000).round();
+  return '${s ~/ 60}:${(s % 60).toString().padLeft(2, '0')}';
+}
+
+class VoiceBubble extends StatefulWidget {
+  const VoiceBubble(
+      {super.key, required this.msg, required this.who, required this.dark});
+  final Msg msg;
+  final Contact who;
+  final bool dark;
+
+  @override
+  State<VoiceBubble> createState() => _VoiceBubbleState();
+}
+
+class _VoiceBubbleState extends State<VoiceBubble> {
+  bool _showText = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = widget.msg;
+    final path = '$_appDirPath/${m.audio}';
+    final exists = File(path).existsSync();
+    final total = m.dur ?? 0;
+    final fg = widget.dark ? Colors.white : Colors.black87;
+    final dim = widget.dark ? Colors.white38 : Colors.black26;
+    final accent = widget.dark ? const Color(0xFF53BDEB) : const Color(0xFF34B7F1);
+    return ListenableBuilder(
+      listenable: AudioHub.i,
+      builder: (context, _) {
+        final hub = AudioHub.i;
+        final active = hub.path == path;
+        final playing = active && hub.playing;
+        final ms = active ? hub.pos.inMilliseconds : 0;
+        final progress = total > 0 ? (ms / total).clamp(0.0, 1.0) : 0.0;
+        final wave = m.wave ?? List.filled(48, 0.3);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Stack(clipBehavior: Clip.none, children: [
+                Avatar(widget.who, radius: 20),
+                Positioned(
+                  right: -4,
+                  bottom: -2,
+                  child: Icon(Icons.mic,
+                      size: 18, color: active ? accent : _waLight),
+                ),
+              ]),
+              const SizedBox(width: 4),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                iconSize: 34,
+                color: fg,
+                icon: Icon(exists
+                    ? (playing ? Icons.pause : Icons.play_arrow)
+                    : Icons.error_outline),
+                onPressed: exists ? () => hub.toggle(path) : null,
+              ),
+              SizedBox(
+                width: 150,
+                height: 34,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: !exists
+                      ? null
+                      : (d) => hub.seek(
+                          path, (d.localPosition.dx / 150).clamp(0.0, 1.0), total),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      for (var k = 0; k < wave.length; k++)
+                        Expanded(
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(horizontal: 0.6),
+                            height: 4 + 28 * wave[k],
+                            decoration: BoxDecoration(
+                              color: (k + 0.5) / wave.length <= progress && active
+                                  ? accent
+                                  : dim,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ]),
+            Padding(
+              padding: const EdgeInsets.only(left: 92),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Text(exists ? _mmss(active ? ms : total) : 'audio indisponible',
+                    style: TextStyle(fontSize: 11.5, color: fg.withValues(alpha: 0.6))),
+                const SizedBox(width: 8),
+                InkWell(
+                  onTap: () => setState(() => _showText = !_showText),
+                  child: Text(_showText ? 'masquer le texte' : 'transcription',
+                      style: TextStyle(
+                          fontSize: 11.5,
+                          color: accent,
+                          decoration: TextDecoration.underline)),
+                ),
+              ]),
+            ),
+            if (_showText || !exists)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(m.text,
+                    style: TextStyle(
+                        fontSize: 14, fontStyle: FontStyle.italic, color: fg)),
+              ),
+          ],
+        );
+      },
     );
   }
 }
@@ -3136,6 +3851,65 @@ class _ModelsPageState extends State<ModelsPage> {
                 const SizedBox(height: 16),
                 Text(b.status),
               ],
+              const SizedBox(height: 24),
+              const Text('Voix des messages vocaux',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text(
+                  Voice.neuralReady
+                      ? '✅ Voix réaliste installée (féminine, ado par défaut). '
+                          'Les contacts peuvent t\'envoyer des vocaux.'
+                      : 'Voix neuronale réaliste, 100 % hors ligne '
+                          '(≈ 67 Mo). Nécessaire pour que les contacts '
+                          'envoient des vocaux.',
+                  style: const TextStyle(fontSize: 12)),
+              if (b.voiceProgress != null) ...[
+                const SizedBox(height: 8),
+                LinearProgressIndicator(value: b.voiceProgress),
+              ],
+              if (b.voiceStatus.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(b.voiceStatus, style: const TextStyle(fontSize: 12)),
+              ],
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: (Voice.neuralReady || b.voiceProgress != null)
+                        ? null
+                        : b.downloadVoice,
+                    icon: const Icon(Icons.record_voice_over),
+                    label: const Text('Installer la voix'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Écouter un exemple',
+                  onPressed: Voice.neuralReady
+                      ? () {
+                          Voice.stop();
+                          Voice.speak(
+                              'Coucou ! Ça va toi ? Moi j\'ai trop rigolé '
+                              'aujourd\'hui. Par contre j\'ai raté mon '
+                              'contrôle de maths…',
+                              Contact(
+                                  id: '_test',
+                                  name: '',
+                                  age: 15,
+                                  description: '',
+                                  color: 0));
+                        }
+                      : null,
+                  icon: const Icon(Icons.play_circle_outline),
+                ),
+                IconButton(
+                  tooltip: 'Supprimer la voix',
+                  onPressed: (Voice.neuralReady && b.voiceProgress == null)
+                      ? b.deleteVoice
+                      : null,
+                  icon: const Icon(Icons.delete_outline),
+                ),
+              ]),
               const SizedBox(height: 24),
               const Text(
                 'Les modèles tournent 100 % sur ton téléphone. '
