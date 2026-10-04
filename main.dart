@@ -9,6 +9,8 @@
 //  - Choix CPU / GPU, temps de réponse affiché
 //  - Photo de profil par contact, mémoire persistante de l'IA,
 //    plusieurs messages d'affilée et temps d'écriture simulé
+//  - Relances spontanées, groupes de discussion, vocal (lecture +
+//    dictée), sauvegarde / restauration, recherche dans les messages
 // ============================================================
 
 import 'dart:async';
@@ -20,7 +22,9 @@ import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_litert_lm/flutter_litert_lm.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 
 void main() => runApp(const MessengerApp());
 
@@ -125,21 +129,36 @@ class Contact {
     this.length = 1,
     this.multi = true,
     this.memoryOn = true,
+    this.isGroup = false,
+    this.nudge = true,
+    this.nudges = 0,
+    this.unread = 0,
+    this.autoSpeak = false,
+    this.pitch = 1.0,
+    List<String>? members,
     List<String>? memory,
     List<Msg>? messages,
-  })  : memory = memory ?? [],
+  })  : members = members ?? [],
+        memory = memory ?? [],
         messages = messages ?? [];
 
   final String id;
   String name;
   int age;
-  String description;
+  String description; // personnalité, ou sujet du groupe
   int color;
   String script; // réponses préenregistrées (texte du .txt importé)
   String? photo; // nom du fichier image dans le dossier de l'app
   int length; // 0 = messages courts, 1 = variable, 2 = longs
   bool multi; // l'IA peut envoyer plusieurs messages d'affilée
   bool memoryOn; // l'IA retient des infos d'une session à l'autre
+  bool isGroup; // discussion de groupe
+  List<String> members; // ids des contacts du groupe
+  bool nudge; // l'IA peut relancer d'elle-même
+  int nudges; // relances envoyées depuis ton dernier message
+  int unread; // messages non lus
+  bool autoSpeak; // lecture à voix haute des nouveaux messages
+  double pitch; // hauteur de la voix (0.5 grave … 2 aiguë)
   List<String> memory; // souvenirs enregistrés par l'IA
   final List<Msg> messages;
 
@@ -154,6 +173,13 @@ class Contact {
         'length': length,
         'multi': multi,
         'memoryOn': memoryOn,
+        'isGroup': isGroup,
+        'members': members,
+        'nudge': nudge,
+        'nudges': nudges,
+        'unread': unread,
+        'autoSpeak': autoSpeak,
+        'pitch': pitch,
         'memory': memory,
         'messages': [for (final m in messages) m.toJson()],
       };
@@ -169,6 +195,15 @@ class Contact {
         length: (j['length'] as num?)?.toInt() ?? 1,
         multi: j['multi'] as bool? ?? true,
         memoryOn: j['memoryOn'] as bool? ?? true,
+        isGroup: j['isGroup'] as bool? ?? false,
+        members: [
+          for (final m in (j['members'] as List? ?? const [])) m.toString(),
+        ],
+        nudge: j['nudge'] as bool? ?? true,
+        nudges: (j['nudges'] as num?)?.toInt() ?? 0,
+        unread: (j['unread'] as num?)?.toInt() ?? 0,
+        autoSpeak: j['autoSpeak'] as bool? ?? false,
+        pitch: (j['pitch'] as num?)?.toDouble() ?? 1.0,
         memory: [
           for (final m in (j['memory'] as List? ?? const [])) m.toString(),
         ],
@@ -180,18 +215,21 @@ class Contact {
 }
 
 class Msg {
-  Msg(this.text, {required this.fromMe, DateTime? time, this.seconds})
+  Msg(this.text,
+      {required this.fromMe, DateTime? time, this.seconds, this.from})
       : time = time ?? DateTime.now();
   final String text;
   final bool fromMe;
   final DateTime time;
   final double? seconds;
+  final String? from; // dans un groupe : id du contact qui a écrit
 
   Map<String, dynamic> toJson() => {
         't': text,
         'me': fromMe,
         'ts': time.millisecondsSinceEpoch,
         if (seconds != null) 's': seconds,
+        if (from != null) 'f': from,
       };
 
   static Msg fromJson(Map<String, dynamic> j) => Msg(
@@ -199,6 +237,7 @@ class Msg {
         fromMe: j['me'] as bool? ?? false,
         time: DateTime.fromMillisecondsSinceEpoch((j['ts'] as num?)?.toInt() ?? 0),
         seconds: (j['s'] as num?)?.toDouble(),
+        from: j['f'] as String?,
       );
 }
 
@@ -345,6 +384,48 @@ String _dayLabel(DateTime t) {
 }
 
 // ---------------------------------------------------------------
+//  Voix : lecture à voix haute (TTS) et dictée (reconnaissance vocale)
+// ---------------------------------------------------------------
+class Voice {
+  static final FlutterTts _tts = FlutterTts();
+  static final SpeechToText stt = SpeechToText();
+  static bool _ttsReady = false;
+  static Future<void> _queue = Future.value();
+
+  static final _emoji = RegExp(
+      r'[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]',
+      unicode: true);
+
+  static Future<void> _init() async {
+    if (_ttsReady) return;
+    _ttsReady = true;
+    await _tts.setLanguage('fr-FR');
+    await _tts.setSpeechRate(0.5);
+    await _tts.awaitSpeakCompletion(true);
+  }
+
+  /// Ajoute un message à la file de lecture.
+  static void speak(String text, {double pitch = 1.0}) {
+    final clean = text.replaceAll(_emoji, '').trim();
+    if (clean.isEmpty) return;
+    _queue = _queue.then((_) async {
+      try {
+        await _init();
+        await _tts.setPitch(pitch);
+        await _tts.speak(clean);
+      } catch (_) {}
+    });
+  }
+
+  static Future<void> stop() async {
+    _queue = Future.value();
+    try {
+      await _tts.stop();
+    } catch (_) {}
+  }
+}
+
+// ---------------------------------------------------------------
 //  Cerveau : stockage + modèle + conversations
 // ---------------------------------------------------------------
 class Brain extends ChangeNotifier {
@@ -367,8 +448,16 @@ class Brain extends ChangeNotifier {
   LiteLmEngine? _engine;
   final Map<String, LiteLmConversation> _convs = {};
   final Set<String> generating = {};
+  // Dans un groupe : nom du membre en train d'écrire.
+  final Map<String, String> typingName = {};
   // Incrémenté quand une discussion est vidée : stoppe une rafale en cours.
   final Map<String, int> _epoch = {};
+  // Une seule génération à la fois sur le moteur.
+  Future<void> _modelQueue = Future.value();
+  // Discussion actuellement ouverte à l'écran (pour les non-lus).
+  String? openChatId;
+  Timer? _nudgeTimer;
+  static final _rng = Random();
 
   late Directory _dir;
   Timer? _saveTimer;
@@ -418,6 +507,8 @@ class Brain extends ChangeNotifier {
       ));
     }
     await refreshDownloaded();
+    _nudgeTimer =
+        Timer.periodic(const Duration(seconds: 45), (_) => _nudgeTick());
   }
 
   void _scheduleSave() {
@@ -425,16 +516,73 @@ class Brain extends ChangeNotifier {
     _saveTimer = Timer(const Duration(milliseconds: 400), saveNow);
   }
 
-  Future<void> saveNow() async {
-    try {
-      await _dataFile.writeAsString(jsonEncode({
+  Map<String, dynamic> _toJson() => {
         'modelId': modelId,
         'customRepo': customRepo,
         'gpu': backend == LiteLmBackend.gpu,
         'typingCps': typingCps,
         'contacts': [for (final c in contacts) c.toJson()],
-      }));
+      };
+
+  Future<void> saveNow() async {
+    try {
+      await _dataFile.writeAsString(jsonEncode(_toJson()));
     } catch (_) {}
+  }
+
+  // ----- Sauvegarde / restauration -----
+  /// Contacts, souvenirs, discussions et photos dans un seul fichier JSON.
+  Future<Uint8List> exportBackup() async {
+    final photos = <String, String>{};
+    for (final c in contacts) {
+      final f = _photoFile(c.photo);
+      if (f != null) photos[c.photo!] = base64Encode(await f.readAsBytes());
+    }
+    return utf8.encode(jsonEncode({
+      'app': 'ia_messenger',
+      'version': 1,
+      'typingCps': typingCps,
+      'contacts': [for (final c in contacts) c.toJson()],
+      'photos': photos,
+    }));
+  }
+
+  /// Remplace tous les contacts par ceux de la sauvegarde.
+  /// Renvoie le nombre de discussions restaurées.
+  Future<int> importBackup(List<int> bytes) async {
+    var txt = utf8.decode(bytes, allowMalformed: true);
+    if (txt.startsWith('﻿')) txt = txt.substring(1);
+    final j = jsonDecode(txt);
+    if (j is! Map || j['app'] != 'ia_messenger' || j['contacts'] is! List) {
+      throw Exception('ce fichier n\'est pas une sauvegarde IA Messenger');
+    }
+    final restored = [
+      for (final c in j['contacts'] as List)
+        Contact.fromJson(Map<String, dynamic>.from(c as Map)),
+    ];
+    final photos = Map<String, dynamic>.from(j['photos'] as Map? ?? const {});
+    for (final e in photos.entries) {
+      // Nom de fichier simple uniquement (pas de chemin).
+      if (e.key.contains('/') || e.key.contains('\\')) continue;
+      await File('${_dir.path}/${e.key}')
+          .writeAsBytes(base64Decode(e.value as String));
+    }
+    await Voice.stop();
+    for (final c in contacts) {
+      _bump(c);
+      if (!photos.containsKey(c.photo)) _deletePhoto(c.photo);
+    }
+    for (final c in _convs.values) {
+      await c.dispose();
+    }
+    _convs.clear();
+    contacts
+      ..clear()
+      ..addAll(restored);
+    typingCps = (j['typingCps'] as num?)?.toInt() ?? typingCps;
+    await saveNow();
+    notifyListeners();
+    return restored.length;
   }
 
   Future<void> refreshDownloaded() async {
@@ -455,6 +603,9 @@ class Brain extends ChangeNotifier {
 
   void deleteContact(Contact c) {
     contacts.remove(c);
+    for (final g in contacts) {
+      g.members.remove(c.id);
+    }
     _bump(c);
     _deletePhoto(c.photo);
     _dropConv(c.id);
@@ -473,6 +624,38 @@ class Brain extends ChangeNotifier {
   void clearMemory(Contact c) {
     c.memory.clear();
     _dropConv(c.id);
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  List<Contact> membersOf(Contact g) => [
+        for (final id in g.members)
+          ...contacts.where((c) => c.id == id && !c.isGroup),
+      ];
+
+  Contact? byId(String? id) {
+    for (final c in contacts) {
+      if (c.id == id) return c;
+    }
+    return null;
+  }
+
+  void openChat(Contact c) {
+    openChatId = c.id;
+    if (c.unread != 0) {
+      c.unread = 0;
+      _scheduleSave();
+      notifyListeners();
+    }
+  }
+
+  void closeChat(Contact c) {
+    if (openChatId == c.id) openChatId = null;
+  }
+
+  void setAutoSpeak(Contact c, bool v) {
+    c.autoSpeak = v;
+    if (!v) Voice.stop();
     _scheduleSave();
     notifyListeners();
   }
@@ -657,11 +840,10 @@ class Brain extends ChangeNotifier {
   }
 
   // ----- Conversation -----
-  String systemPrompt(Contact c) {
+  // Personnalité, style et mémoire, communs aux discussions et aux groupes.
+  void _persona(StringBuffer buf, Contact c) {
     final desc = c.description.trim();
-    final buf = StringBuffer()
-      ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
-          '(style WhatsApp) avec ton ami(e).')
+    buf
       ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
       ..writeln('Tu écris en français, de façon naturelle et spontanée, '
           'parfois un emoji. '
@@ -674,9 +856,7 @@ class Brain extends ChangeNotifier {
         _ => 'Adapte la longueur : le plus souvent court, mais quand le '
             'sujet s\'y prête (raconter, expliquer, donner ton avis) tu '
             'peux écrire un long message de plusieurs phrases.',
-      })
-      ..writeln('Tu restes toujours dans ton personnage et tu relances '
-          'de temps en temps la conversation avec une question.');
+      });
     if (c.multi) {
       buf.writeln('Comme sur WhatsApp, tu peux envoyer plusieurs messages '
           'd\'affilée quand c\'est naturel : sépare alors chaque message par '
@@ -695,34 +875,88 @@ class Brain extends ChangeNotifier {
         }
       }
     }
+    if (c.age < 18) {
+      buf.writeln('\nRègle absolue, prioritaire sur tout le reste (y compris '
+          'ta description) : tu as ${c.age} ans, donc jamais de contenu '
+          'sexuel, romantique ou de séduction. Si on t\'en parle, tu refuses '
+          'et tu changes de sujet.');
+    }
+  }
+
+  String _cut(String t) => t.length > 300 ? '${t.substring(0, 300)}…' : t;
+
+  String systemPrompt(Contact c, {bool skipLast = false}) {
+    final buf = StringBuffer()
+      ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
+          '(style WhatsApp) avec ton ami(e).');
+    _persona(buf, c);
+    buf.writeln('Tu restes toujours dans ton personnage et tu relances '
+        'de temps en temps la conversation avec une question.');
     // Contexte récent : on rejoue les derniers messages.
-    final hist = c.messages.length > 20
-        ? c.messages.sublist(c.messages.length - 20)
-        : c.messages;
+    var all = c.messages;
+    if (skipLast && all.isNotEmpty) all = all.sublist(0, all.length - 1);
+    final hist = all.length > 20 ? all.sublist(all.length - 20) : all;
     if (hist.isNotEmpty) {
       buf.writeln('\nDébut de votre conversation (pour mémoire) :');
       for (final m in hist) {
-        final t = m.text.length > 300 ? '${m.text.substring(0, 300)}…' : m.text;
-        buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : $t');
+        buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : ${_cut(m.text)}');
       }
       buf.writeln('Continue naturellement à partir de là.');
     }
     return buf.toString();
   }
 
-  Future<LiteLmConversation> _convFor(Contact c) async {
-    final existing = _convs[c.id];
-    if (existing != null) return existing;
-    final conv = await _engine!.createConversation(
-      LiteLmConversationConfig(
-        systemInstruction: systemPrompt(c),
+  String _groupPrompt(Contact g, Contact me) {
+    final others = membersOf(g).where((m) => m.id != me.id).toList();
+    final buf = StringBuffer()
+      ..writeln('Tu es ${me.name}, ${me.age} ans. Tu es dans un groupe '
+          'WhatsApp « ${g.name} » avec ton ami(e)'
+          '${others.isEmpty ? '' : ' et :'}');
+    for (final o in others) {
+      final d = o.description.trim();
+      buf.writeln('- ${o.name}, ${o.age} ans${d.isEmpty ? '' : ' : ${_cut(d)}'}');
+    }
+    if (g.description.trim().isNotEmpty) {
+      buf.writeln('Sujet du groupe : ${g.description.trim()}');
+    }
+    _persona(buf, me);
+    buf.writeln('Tu ne parles qu\'en ton nom : n\'écris jamais les messages '
+        'des autres. Tu peux répondre à ton ami(e) ou réagir à ce qu\'ont '
+        'dit les autres en les appelant par leur prénom.');
+    final hist = g.messages.length > 25
+        ? g.messages.sublist(g.messages.length - 25)
+        : g.messages;
+    if (hist.isNotEmpty) {
+      buf.writeln('\nDerniers messages du groupe :');
+      for (final m in hist) {
+        final who = m.fromMe ? 'Ami(e)' : (byId(m.from)?.name ?? '?');
+        buf.writeln('$who : ${_cut(m.text)}');
+      }
+    }
+    return buf.toString();
+  }
+
+  LiteLmConversationConfig _cfg(String system) => LiteLmConversationConfig(
+        systemInstruction: system,
         samplerConfig: const LiteLmSamplerConfig(
           temperature: 0.8,
           topK: 40,
           topP: 0.95,
         ),
-      ),
-    );
+      );
+
+  // Les générations passent l'une après l'autre sur le moteur.
+  Future<T> _exclusive<T>(Future<T> Function() f) {
+    final run = _modelQueue.then((_) => f());
+    _modelQueue = run.then((_) {}, onError: (_) {});
+    return run;
+  }
+
+  Future<LiteLmConversation> _convFor(Contact c, {bool skipLast = false}) async {
+    final existing = _convs[c.id];
+    if (existing != null) return existing;
+    final conv = await _engine!
+        .createConversation(_cfg(systemPrompt(c, skipLast: skipLast)));
     _convs[c.id] = conv;
     return conv;
   }
@@ -734,22 +968,39 @@ class Brain extends ChangeNotifier {
     return out.trim();
   }
 
+  String _ago(int minutes) {
+    if (minutes < 60) return '$minutes minutes';
+    if (minutes < 60 * 24) return '${minutes ~/ 60} h';
+    return '${minutes ~/ (60 * 24)} jour(s)';
+  }
+
   Future<void> send(Contact c, String text) async {
-    final book = _bookFor(c);
-    if ((book == null && !ready) || generating.contains(c.id)) return;
+    if (!canReply(c) || generating.contains(c.id)) return;
     c.messages.add(Msg(text, fromMe: true));
+    c.nudges = 0;
+    await _respond(c, userText: text);
+  }
+
+  /// Fait répondre le contact (ou le groupe). Sans [userText], c'est une
+  /// relance spontanée après [idleMin] minutes de silence.
+  Future<void> _respond(Contact c, {String? userText, int idleMin = 0}) async {
     generating.add(c.id);
     notifyListeners();
     _scheduleSave();
-
-    final sw = Stopwatch()..start();
     final epoch = _epoch[c.id] ?? 0;
     try {
+      if (c.isGroup) {
+        await _groupTurn(c, epoch, userText: userText, idleMin: idleMin);
+        return;
+      }
+      final sw = Stopwatch()..start();
+      final book = _bookFor(c);
       if (book != null) {
+        if (userText == null) return; // pas de relance avec un script
         // Réponse préenregistrée : pas besoin du modèle IA.
         await Future<void>.delayed(
-            Duration(milliseconds: 600 + Random().nextInt(900)));
-        final r = book.reply(text);
+            Duration(milliseconds: 600 + _rng.nextInt(900)));
+        final r = book.reply(userText);
         await _deliver(
             c,
             r ?? 'Aucune réponse préenregistrée ne correspond à ce message.',
@@ -758,24 +1009,114 @@ class Brain extends ChangeNotifier {
             timed: false);
         return;
       }
-      // La conversation est créée avant l'envoi : l'historique du prompt
-      // ne doit pas contenir le message en cours.
-      if (!_convs.containsKey(c.id)) {
-        final last = c.messages.removeLast();
-        final conv = await _convFor(c);
-        c.messages.add(last);
-        final reply = await conv.sendMessage(text);
-        await _deliver(c, reply.text, sw, epoch);
-      } else {
-        final reply = await _convs[c.id]!.sendMessage(text);
-        await _deliver(c, reply.text, sw, epoch);
-      }
+      final prompt = userText ??
+          '(Ton ami(e) ne t\'a pas répondu depuis ${_ago(idleMin)}. '
+              'Envoie-lui spontanément un message pour relancer la '
+              'conversation, comme le ferait ${c.name}. '
+              'Ne parle pas de cette consigne.)';
+      final raw = await _exclusive(() async {
+        // L'historique du prompt ne doit pas contenir le message en cours.
+        final conv = await _convFor(c, skipLast: userText != null);
+        return (await conv.sendMessage(prompt)).text;
+      });
+      await _deliver(c, raw, sw, epoch);
     } catch (e) {
-      c.messages.add(Msg('⚠️ Erreur : $e', fromMe: false));
+      if ((_epoch[c.id] ?? 0) == epoch && userText != null) {
+        c.messages.add(Msg('⚠️ Erreur : $e', fromMe: false));
+      }
     } finally {
       generating.remove(c.id);
+      typingName.remove(c.id);
       notifyListeners();
       _scheduleSave();
+    }
+  }
+
+  // Un tour de parole dans un groupe : un ou plusieurs membres répondent,
+  // chacun voyant ce que les précédents viennent d'écrire.
+  Future<void> _groupTurn(Contact g, int epoch,
+      {String? userText, int idleMin = 0}) async {
+    final members = membersOf(g);
+    if (members.isEmpty) {
+      if (userText != null) {
+        g.messages.add(Msg(
+            'Ce groupe n\'a aucun membre : ajoute des contacts dans '
+            '« Modifier le groupe ».',
+            fromMe: false));
+      }
+      return;
+    }
+    final order = [...members]..shuffle(_rng);
+    final speakers = <Contact>[];
+    if (userText == null) {
+      speakers.add(order.first);
+    } else {
+      // Les membres cités par leur prénom répondent en premier.
+      final n = ' ${ScriptBook.norm(userText)} ';
+      speakers.addAll(
+          order.where((m) => n.contains(' ${ScriptBook.norm(m.name)} ')));
+      for (final m in order) {
+        if (speakers.contains(m)) continue;
+        if (speakers.isEmpty ||
+            (speakers.length < 3 && _rng.nextDouble() < 0.5)) {
+          speakers.add(m);
+        }
+      }
+    }
+    for (final m in speakers) {
+      if ((_epoch[g.id] ?? 0) != epoch || !contacts.contains(g)) return;
+      typingName[g.id] = m.name;
+      notifyListeners();
+      final sw = Stopwatch()..start();
+      final book = _bookFor(m);
+      String? raw;
+      if (book != null) {
+        if (userText == null) continue;
+        await Future<void>.delayed(
+            Duration(milliseconds: 600 + _rng.nextInt(900)));
+        raw = book.reply(userText);
+      } else if (ready) {
+        final system = _groupPrompt(g, m);
+        final instr = userText == null
+            ? '(Le groupe est calme depuis ${_ago(idleMin)}. Écris un '
+                'message spontané : lance un sujet ou interpelle quelqu\'un.)'
+            : '(Écris maintenant ton message dans le groupe, en tant que '
+                '${m.name}. Seulement ton message, sans ton prénom devant.)';
+        final out = await _exclusive(() async {
+          final conv = await _engine!.createConversation(_cfg(system));
+          try {
+            return (await conv.sendMessage(instr)).text;
+          } finally {
+            await conv.dispose();
+          }
+        });
+        raw = out.replaceFirst(
+            RegExp('^\\s*${RegExp.escape(m.name)}\\s*:\\s*',
+                caseSensitive: false),
+            '');
+      }
+      if (raw == null || raw.trim().isEmpty) continue;
+      await _deliver(g, raw, sw, epoch, author: m);
+    }
+  }
+
+  // Relances : si tu ne réponds plus, le contact t'écrit de lui-même
+  // (2 fois maximum, puis il attend ton prochain message).
+  void _nudgeTick() {
+    if (!ready) return;
+    final now = DateTime.now();
+    for (final c in contacts) {
+      if (!c.nudge || c.nudges >= 2 || c.messages.isEmpty) continue;
+      if (generating.contains(c.id)) continue;
+      if (c.isGroup ? membersOf(c).isEmpty : _bookFor(c) != null) continue;
+      final last = c.messages.last;
+      if (last.fromMe || last.text.startsWith('⚠️')) continue;
+      final idle = now.difference(last.time).inMinutes;
+      if (idle < (c.nudges == 0 ? 6 : 45) || idle > 7 * 24 * 60) continue;
+      if (_rng.nextDouble() > 0.35) continue; // un peu d'imprévu
+      c.nudges++;
+      unawaited(_respond(c, idleMin: idle));
+      return; // une relance à la fois
     }
   }
 
@@ -786,7 +1127,9 @@ class Brain extends ChangeNotifier {
     return b.isEmpty ? null : b;
   }
 
-  bool canReply(Contact c) => ready || _bookFor(c) != null;
+  bool canReply(Contact c) => c.isGroup
+      ? ready || membersOf(c).any((m) => _bookFor(m) != null)
+      : ready || _bookFor(c) != null;
 
   // ----- Confort de chat -----
   Future<void> regenerate(Contact c) async {
@@ -823,7 +1166,7 @@ class Brain extends ChangeNotifier {
       final t = m.time;
       b.writeln('[${t.day.toString().padLeft(2, '0')}/'
           '${t.month.toString().padLeft(2, '0')} ${_hhmm(t)}] '
-          '${m.fromMe ? 'Moi' : c.name} : ${m.text}');
+          '${m.fromMe ? 'Moi' : (byId(m.from) ?? c).name} : ${m.text}');
     }
     return b.toString();
   }
@@ -879,20 +1222,21 @@ class Brain extends ChangeNotifier {
   }
 
   Future<void> _deliver(Contact c, String raw, Stopwatch sw, int epoch,
-      {bool timed = true}) async {
+      {bool timed = true, Contact? author}) async {
+    final who = author ?? c; // dans un groupe : le membre qui écrit
     final genSeconds = sw.elapsedMilliseconds / 1000;
-    final memBefore = c.memory.length;
-    var text = _extractMemory(c, _clean(raw));
+    final memBefore = who.memory.length;
+    final text = _extractMemory(who, _clean(raw));
     var parts = _split(text);
-    if (!c.multi && parts.length > 1) parts = [parts.join('\n\n')];
+    if (!who.multi && parts.length > 1) parts = [parts.join('\n\n')];
     if (parts.isEmpty) parts = ['…'];
-    if (c.memory.length != memBefore) _scheduleSave();
+    if (who.memory.length != memBefore) _scheduleSave();
     for (var i = 0; i < parts.length; i++) {
       final p = parts[i];
       if (i > 0) {
         // Petite pause entre deux messages, comme une vraie personne.
         await Future<void>.delayed(
-            Duration(milliseconds: 400 + Random().nextInt(700)));
+            Duration(milliseconds: 400 + _rng.nextInt(700)));
       }
       // Le temps de génération compte déjà comme temps d'écriture.
       var wait = _typingTime(p);
@@ -903,7 +1247,13 @@ class Brain extends ChangeNotifier {
         p,
         fromMe: false,
         seconds: (timed && i == 0) ? genSeconds : null,
+        from: author?.id,
       ));
+      if (openChatId != c.id) {
+        c.unread++;
+      } else if (c.autoSpeak) {
+        Voice.speak(p, pitch: who.pitch);
+      }
       notifyListeners();
       _scheduleSave();
     }
@@ -912,6 +1262,7 @@ class Brain extends ChangeNotifier {
   @override
   void dispose() {
     _saveTimer?.cancel();
+    _nudgeTimer?.cancel();
     unload();
     super.dispose();
   }
@@ -1010,6 +1361,28 @@ class AvatarView extends StatelessWidget {
   }
 }
 
+Widget editPageFor(Brain brain, Contact c) => c.isGroup
+    ? GroupEditPage(brain: brain, group: c)
+    : ContactEditPage(brain: brain, contact: c);
+
+/// Choisit une image dans la galerie et la copie dans le dossier de l'app.
+/// Renvoie le nom du fichier créé (null si annulé).
+Future<String?> pickPhotoFile() async {
+  final res =
+      await FilePicker.platform.pickFiles(type: FileType.image, withData: true);
+  if (res == null || res.files.isEmpty) return null;
+  final f = res.files.first;
+  List<int>? bytes = f.bytes;
+  if (bytes == null && f.path != null) {
+    bytes = await File(f.path!).readAsBytes();
+  }
+  if (bytes == null) throw Exception('image illisible');
+  final ext = (f.extension ?? 'jpg').toLowerCase();
+  final name = 'avatar_${DateTime.now().microsecondsSinceEpoch}.$ext';
+  await File('$_appDirPath/$name').writeAsBytes(bytes);
+  return name;
+}
+
 class ChatsPage extends StatefulWidget {
   const ChatsPage({super.key, required this.brain});
   final Brain brain;
@@ -1075,6 +1448,25 @@ class _ChatsPageState extends State<ChatsPage> {
                     MaterialPageRoute(
                         builder: (_) => ModelsPage(brain: brain))),
               ),
+              PopupMenuButton<String>(
+                onSelected: (v) {
+                  if (v == 'group') {
+                    Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => GroupEditPage(brain: brain)));
+                  } else if (v == 'backup') {
+                    _backup();
+                  } else if (v == 'restore') {
+                    _restore();
+                  }
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'group', child: Text('Nouveau groupe')),
+                  PopupMenuItem(value: 'backup', child: Text('Sauvegarder')),
+                  PopupMenuItem(value: 'restore', child: Text('Restaurer')),
+                ],
+              ),
             ],
           ),
           body: Column(
@@ -1102,6 +1494,14 @@ class _ChatsPageState extends State<ChatsPage> {
                     final c = shown[i];
                     final last = c.messages.isEmpty ? null : c.messages.last;
                     final typing = brain.generating.contains(c.id);
+                    final who = brain.typingName[c.id];
+                    final author = last == null
+                        ? ''
+                        : last.fromMe
+                            ? 'Toi : '
+                            : (c.isGroup && last.from != null
+                                ? '${brain.byId(last.from)?.name ?? '?'} : '
+                                : '');
                     return Dismissible(
                       key: ValueKey(c.id),
                       direction: DismissDirection.endToStart,
@@ -1116,8 +1516,10 @@ class _ChatsPageState extends State<ChatsPage> {
                             context: context,
                             builder: (ctx) => AlertDialog(
                               title: Text('Supprimer ${c.name} ?'),
-                              content: const Text(
-                                  'Le contact et sa discussion seront effacés.'),
+                              content: Text(c.isGroup
+                                  ? 'Le groupe et sa discussion seront effacés '
+                                      '(pas ses membres).'
+                                  : 'Le contact et sa discussion seront effacés.'),
                               actions: [
                                 TextButton(
                                     onPressed: () => Navigator.pop(ctx, false),
@@ -1132,14 +1534,31 @@ class _ChatsPageState extends State<ChatsPage> {
                       onDismissed: (_) => brain.deleteContact(c),
                       child: ListTile(
                       leading: Avatar(c),
-                      title: Text(c.name,
-                          style: const TextStyle(fontWeight: FontWeight.w600)),
+                      title: Row(children: [
+                        if (c.isGroup)
+                          const Padding(
+                            padding: EdgeInsets.only(right: 4),
+                            child: Icon(Icons.groups, size: 18),
+                          ),
+                        Expanded(
+                          child: Text(c.name,
+                              overflow: TextOverflow.ellipsis,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w600)),
+                        ),
+                      ]),
                       subtitle: Text(
                         typing
-                            ? 'en train d\'écrire…'
+                            ? (who != null
+                                ? '$who est en train d\'écrire…'
+                                : 'en train d\'écrire…')
                             : (last == null
-                                ? 'Dis bonjour 👋'
-                                : '${last.fromMe ? 'Toi : ' : ''}${last.text}'),
+                                ? (c.isGroup
+                                    ? brain.membersOf(c)
+                                        .map((m) => m.name)
+                                        .join(', ')
+                                    : 'Dis bonjour 👋')
+                                : '$author${last.text}'),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
@@ -1149,10 +1568,34 @@ class _ChatsPageState extends State<ChatsPage> {
                       ),
                       trailing: last == null
                           ? null
-                          : Text(_dayLabel(last.time),
-                              style: TextStyle(
-                                  fontSize: 12,
-                                  color: Theme.of(context).hintColor)),
+                          : Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(_dayLabel(last.time),
+                                    style: TextStyle(
+                                        fontSize: 12,
+                                        color: c.unread > 0
+                                            ? _waLight
+                                            : Theme.of(context).hintColor)),
+                                if (c.unread > 0) ...[
+                                  const SizedBox(height: 4),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 7, vertical: 2),
+                                    decoration: BoxDecoration(
+                                        color: _waLight,
+                                        borderRadius:
+                                            BorderRadius.circular(10)),
+                                    child: Text('${c.unread}',
+                                        style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.bold)),
+                                  ),
+                                ],
+                              ],
+                            ),
                       onTap: () => Navigator.push(
                           context,
                           MaterialPageRoute(
@@ -1177,6 +1620,62 @@ class _ChatsPageState extends State<ChatsPage> {
     );
   }
 
+  void _snack(String t) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+
+  Future<void> _backup() async {
+    try {
+      final bytes = await brain.exportBackup();
+      final d = DateTime.now();
+      final name = 'ia_messenger_${d.year}'
+          '${d.month.toString().padLeft(2, '0')}'
+          '${d.day.toString().padLeft(2, '0')}.json';
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Enregistrer la sauvegarde',
+        fileName: name,
+        bytes: bytes,
+      );
+      if (path != null) _snack('Sauvegarde enregistrée ✅');
+    } catch (e) {
+      _snack('Erreur de sauvegarde : $e');
+    }
+  }
+
+  Future<void> _restore() async {
+    try {
+      final res = await FilePicker.platform
+          .pickFiles(type: FileType.any, withData: true);
+      if (res == null || res.files.isEmpty) return;
+      final f = res.files.first;
+      List<int>? bytes = f.bytes;
+      if (bytes == null && f.path != null) {
+        bytes = await File(f.path!).readAsBytes();
+      }
+      if (bytes == null || !mounted) return;
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Restaurer la sauvegarde ?'),
+          content: const Text('Tous les contacts, groupes, souvenirs et '
+              'discussions actuels seront remplacés par ceux du fichier.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Annuler')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Remplacer')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+      final n = await brain.importBackup(bytes);
+      _snack('$n discussion(s) restaurée(s) ✅');
+    } catch (e) {
+      _snack('Erreur de restauration : $e');
+    }
+  }
+
   void _contactMenu(BuildContext context, Contact c) {
     showModalBottomSheet<void>(
       context: context,
@@ -1184,14 +1683,11 @@ class _ChatsPageState extends State<ChatsPage> {
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           ListTile(
             leading: const Icon(Icons.edit),
-            title: const Text('Modifier le contact'),
+            title: Text(c.isGroup ? 'Modifier le groupe' : 'Modifier le contact'),
             onTap: () {
               Navigator.pop(ctx);
-              Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                      builder: (_) =>
-                          ContactEditPage(brain: brain, contact: c)));
+              Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => editPageFor(brain, c)));
             },
           ),
           ListTile(
@@ -1204,7 +1700,8 @@ class _ChatsPageState extends State<ChatsPage> {
           ),
           ListTile(
             leading: const Icon(Icons.delete, color: Colors.red),
-            title: const Text('Supprimer le contact'),
+            title: Text(
+                c.isGroup ? 'Supprimer le groupe' : 'Supprimer le contact'),
             onTap: () {
               Navigator.pop(ctx);
               brain.deleteContact(c);
@@ -1241,11 +1738,15 @@ class _ContactEditPageState extends State<ContactEditPage> {
   int _length = 1;
   bool _multi = true;
   bool _memoryOn = true;
+  bool _nudge = true;
+  double _pitch = 1.0;
 
   @override
   void initState() {
     super.initState();
     final c = widget.contact;
+    _nudge = c?.nudge ?? true;
+    _pitch = c?.pitch ?? 1.0;
     _script = c?.script ?? '';
     _photo = _origPhoto = c?.photo;
     _length = c?.length ?? 1;
@@ -1299,18 +1800,8 @@ class _ContactEditPageState extends State<ContactEditPage> {
 
   Future<void> _pickPhoto() async {
     try {
-      final res = await FilePicker.platform
-          .pickFiles(type: FileType.image, withData: true);
-      if (res == null || res.files.isEmpty) return;
-      final f = res.files.first;
-      List<int>? bytes = f.bytes;
-      if (bytes == null && f.path != null) {
-        bytes = await File(f.path!).readAsBytes();
-      }
-      if (bytes == null) throw Exception('image illisible');
-      final ext = (f.extension ?? 'jpg').toLowerCase();
-      final name = 'avatar_${DateTime.now().microsecondsSinceEpoch}.$ext';
-      await File('$_appDirPath/$name').writeAsBytes(bytes);
+      final name = await pickPhotoFile();
+      if (name == null) return;
       if (_photo != _origPhoto) _deletePhoto(_photo);
       if (mounted) setState(() => _photo = name);
     } catch (e) {
@@ -1396,6 +1887,8 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..length = _length
       ..multi = _multi
       ..memoryOn = _memoryOn
+      ..nudge = _nudge
+      ..pitch = _pitch
       ..memory = [
         for (final l in _memory.text.split('\n'))
           if (l.trim().isNotEmpty) l.trim(),
@@ -1523,6 +2016,42 @@ class _ContactEditPageState extends State<ContactEditPage> {
                     value: _multi,
                     onChanged: (v) => setState(() => _multi = v),
                   ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('M\'écrit de lui-même'),
+                    subtitle: const Text('Relance la discussion si tu ne '
+                        'réponds plus (app ouverte)'),
+                    value: _nudge,
+                    onChanged: (v) => setState(() => _nudge = v),
+                  ),
+                  const SizedBox(height: 4),
+                  Row(children: [
+                    const Text('Voix'),
+                    Expanded(
+                      child: Slider(
+                        min: 0.5,
+                        max: 2.0,
+                        divisions: 15,
+                        value: _pitch,
+                        label: _pitch < 0.9
+                            ? 'grave'
+                            : _pitch > 1.2
+                                ? 'aiguë'
+                                : 'normale',
+                        onChanged: (v) => setState(() => _pitch = v),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Tester la voix',
+                      icon: const Icon(Icons.volume_up),
+                      onPressed: () {
+                        Voice.stop();
+                        Voice.speak(
+                            'Salut, c\'est ${_name.text.trim().isEmpty ? 'moi' : _name.text.trim()} !',
+                            pitch: _pitch);
+                      },
+                    ),
+                  ]),
                 ],
               ),
             ),
@@ -1607,6 +2136,216 @@ class _ContactEditPageState extends State<ContactEditPage> {
 }
 
 // ---------------------------------------------------------------
+//  Création / édition d'un groupe
+// ---------------------------------------------------------------
+class GroupEditPage extends StatefulWidget {
+  const GroupEditPage({super.key, required this.brain, this.group});
+  final Brain brain;
+  final Contact? group;
+
+  @override
+  State<GroupEditPage> createState() => _GroupEditPageState();
+}
+
+class _GroupEditPageState extends State<GroupEditPage> {
+  late final TextEditingController _name;
+  late final TextEditingController _topic;
+  late int _color;
+  late final Set<String> _members;
+  String? _photo;
+  String? _origPhoto;
+  bool _saved = false;
+  bool _nudge = true;
+
+  @override
+  void initState() {
+    super.initState();
+    final g = widget.group;
+    _name = TextEditingController(text: g?.name ?? '');
+    _topic = TextEditingController(text: g?.description ?? '');
+    _color = g?.color ??
+        _palette[widget.brain.contacts.length % _palette.length];
+    _members = {...?g?.members};
+    _photo = _origPhoto = g?.photo;
+    _nudge = g?.nudge ?? true;
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _topic.dispose();
+    if (!_saved && _photo != _origPhoto) _deletePhoto(_photo);
+    super.dispose();
+  }
+
+  Future<void> _pickPhoto() async {
+    try {
+      final name = await pickPhotoFile();
+      if (name == null) return;
+      if (_photo != _origPhoto) _deletePhoto(_photo);
+      if (mounted) setState(() => _photo = name);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Erreur photo : $e')));
+      }
+    }
+  }
+
+  void _save() {
+    final name = _name.text.trim();
+    if (name.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Donne un nom au groupe.')));
+      return;
+    }
+    if (_members.length < 2) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Choisis au moins 2 contacts pour le groupe.')));
+      return;
+    }
+    final g = widget.group ??
+        Contact(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          name: name,
+          age: 18,
+          description: '',
+          color: _color,
+          isGroup: true,
+        );
+    final contacts = widget.brain.contacts;
+    g
+      ..name = name
+      ..description = _topic.text.trim()
+      ..color = _color
+      ..photo = _photo
+      ..nudge = _nudge
+      // On garde l'ordre des contacts.
+      ..members = [
+        for (final c in contacts)
+          if (_members.contains(c.id)) c.id,
+      ];
+    if (_origPhoto != _photo) _deletePhoto(_origPhoto);
+    _saved = true;
+    widget.brain.addOrUpdate(g);
+    Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final people =
+        widget.brain.contacts.where((c) => !c.isGroup).toList();
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.group == null ? 'Nouveau groupe' : 'Modifier le groupe'),
+        actions: [IconButton(icon: const Icon(Icons.check), onPressed: _save)],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Center(
+            child: GestureDetector(
+              onTap: _pickPhoto,
+              child: Stack(children: [
+                AvatarView(
+                    name: _name.text,
+                    color: _color,
+                    photo: _photo,
+                    radius: 48),
+                const Positioned(
+                  right: 0,
+                  bottom: 0,
+                  child: CircleAvatar(
+                    radius: 16,
+                    backgroundColor: _waLight,
+                    child: Icon(Icons.photo_camera,
+                        size: 18, color: Colors.white),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+          if (_photo != null)
+            Center(
+              child: TextButton(
+                onPressed: () {
+                  if (_photo != _origPhoto) _deletePhoto(_photo);
+                  setState(() => _photo = null);
+                },
+                child: const Text('Retirer la photo'),
+              ),
+            ),
+          const SizedBox(height: 12),
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 8,
+            children: [
+              for (final p in _palette)
+                GestureDetector(
+                  onTap: () => setState(() => _color = p),
+                  child: CircleAvatar(
+                    radius: 14,
+                    backgroundColor: Color(p),
+                    child: _color == p
+                        ? const Icon(Icons.check, size: 16, color: Colors.white)
+                        : null,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _name,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(
+                labelText: 'Nom du groupe', border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _topic,
+            minLines: 2,
+            maxLines: 5,
+            decoration: const InputDecoration(
+              labelText: 'Sujet / contexte (facultatif)',
+              hintText: 'ex : les potes du lycée qui organisent un week-end',
+              border: OutlineInputBorder(),
+              alignLabelWithHint: true,
+            ),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Les membres écrivent d\'eux-mêmes'),
+            subtitle: const Text('Le groupe s\'anime quand personne ne parle'),
+            value: _nudge,
+            onChanged: (v) => setState(() => _nudge = v),
+          ),
+          const SizedBox(height: 8),
+          Text('Membres (${_members.length})',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          if (people.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(8),
+              child: Text('Crée d\'abord des contacts.'),
+            ),
+          for (final c in people)
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: Avatar(c, radius: 20),
+              title: Text(c.name),
+              subtitle: Text('${c.age} ans'),
+              value: _members.contains(c.id),
+              onChanged: (v) => setState(() =>
+                  v == true ? _members.add(c.id) : _members.remove(c.id)),
+            ),
+          const SizedBox(height: 8),
+          FilledButton(onPressed: _save, child: const Text('Enregistrer')),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------
 //  Discussion
 // ---------------------------------------------------------------
 class ChatPage extends StatefulWidget {
@@ -1622,15 +2361,140 @@ class _ChatPageState extends State<ChatPage> {
   final _ctrl = TextEditingController();
   final _scroll = ScrollController();
   int _lastCount = -1;
+  bool _listening = false;
+  bool _searching = false;
+  String _query = '';
+  Msg? _highlight;
+  final Map<Msg, GlobalKey> _keys = {};
 
   Brain get brain => widget.brain;
   Contact get c => widget.contact;
 
   @override
+  void initState() {
+    super.initState();
+    brain.openChatId = c.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) => brain.openChat(c));
+  }
+
+  @override
   void dispose() {
+    brain.closeChat(c);
+    if (_listening) Voice.stt.stop();
+    Voice.stop();
     _ctrl.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _snack(String t) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+
+  // ----- Dictée -----
+  Future<void> _toggleMic() async {
+    if (_listening) {
+      await Voice.stt.stop();
+      if (mounted) setState(() => _listening = false);
+      return;
+    }
+    try {
+      final ok = await Voice.stt.initialize();
+      Voice.stt.statusListener = (st) {
+        if ((st == 'done' || st == 'notListening') && mounted) {
+          setState(() => _listening = false);
+        }
+      };
+      Voice.stt.errorListener = (_) {
+        if (mounted) setState(() => _listening = false);
+      };
+      if (!ok) {
+        _snack('Dictée indisponible : autorise le micro pour l\'app.');
+        return;
+      }
+      final base = _ctrl.text.trim();
+      setState(() => _listening = true);
+      await Voice.stt.listen(
+        onResult: (r) {
+          final t = r.recognizedWords;
+          _ctrl.text = base.isEmpty ? t : '$base $t';
+          _ctrl.selection =
+              TextSelection.collapsed(offset: _ctrl.text.length);
+        },
+        listenOptions: SpeechListenOptions(
+          localeId: 'fr_FR',
+          partialResults: true,
+          listenFor: const Duration(minutes: 1),
+          pauseFor: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (mounted) setState(() => _listening = false);
+      _snack('Erreur de dictée : $e');
+    }
+  }
+
+  // ----- Recherche -----
+  List<Msg> get _matches {
+    final q = ScriptBook.norm(_query);
+    if (q.isEmpty) return const [];
+    return [
+      for (final m in c.messages)
+        if (ScriptBook.norm(m.text).contains(q)) m,
+    ];
+  }
+
+  void _jumpTo(Msg m) {
+    setState(() {
+      _searching = false;
+      _query = '';
+      _highlight = m;
+    });
+    final i = c.messages.indexOf(m);
+    var tries = 0;
+    void attempt() {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final ctx = _keys[m]?.currentContext;
+        if (ctx != null) {
+          Scrollable.ensureVisible(ctx,
+              alignment: 0.3, duration: const Duration(milliseconds: 250));
+          return;
+        }
+        // Message pas encore construit : on saute à sa position estimée.
+        if (_scroll.hasClients && i >= 0 && tries++ < 6) {
+          final extent = _scroll.position.maxScrollExtent;
+          _scroll.jumpTo(extent * i / max(1, c.messages.length - 1));
+          attempt();
+        }
+      });
+    }
+
+    attempt();
+    Future<void>.delayed(const Duration(seconds: 2), () {
+      if (mounted && identical(_highlight, m)) setState(() => _highlight = null);
+    });
+  }
+
+  Widget _searchResults() {
+    final res = _matches;
+    if (_query.trim().isEmpty) {
+      return const Center(child: Text('Tape un mot à chercher'));
+    }
+    if (res.isEmpty) return const Center(child: Text('Aucun message trouvé'));
+    return ListView.separated(
+      itemCount: res.length,
+      separatorBuilder: (_, _) => const Divider(height: 1),
+      itemBuilder: (context, i) {
+        final m = res[res.length - 1 - i]; // les plus récents en haut
+        final who = m.fromMe ? 'Toi' : (brain.byId(m.from) ?? c).name;
+        final t = m.time;
+        return ListTile(
+          title: Text(m.text, maxLines: 2, overflow: TextOverflow.ellipsis),
+          subtitle: Text('$who · ${t.day.toString().padLeft(2, '0')}/'
+              '${t.month.toString().padLeft(2, '0')} ${_hhmm(t)}'),
+          onTap: () => _jumpTo(m),
+        );
+      },
+    );
   }
 
   void _scrollToEnd() {
@@ -1650,6 +2514,10 @@ class _ChatPageState extends State<ChatPage> {
           content: Text('Charge d\'abord un modèle (icône puce en haut).')));
       return;
     }
+    if (_listening) {
+      await Voice.stt.stop();
+      setState(() => _listening = false);
+    }
     _ctrl.clear();
     unawaited(brain.send(c, text));
   }
@@ -1666,7 +2534,28 @@ class _ChatPageState extends State<ChatPage> {
           _scrollToEnd();
         }
         return Scaffold(
-          appBar: AppBar(
+          appBar: _searching
+              ? AppBar(
+                  leading: IconButton(
+                    icon: const Icon(Icons.arrow_back),
+                    onPressed: () => setState(() {
+                      _searching = false;
+                      _query = '';
+                    }),
+                  ),
+                  title: TextField(
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white),
+                    cursorColor: Colors.white,
+                    decoration: const InputDecoration(
+                      hintText: 'Rechercher dans la discussion',
+                      hintStyle: TextStyle(color: Colors.white70),
+                      border: InputBorder.none,
+                    ),
+                    onChanged: (v) => setState(() => _query = v),
+                  ),
+                )
+              : AppBar(
             titleSpacing: 0,
             title: Row(children: [
               Avatar(c, radius: 18),
@@ -1675,8 +2564,19 @@ class _ChatPageState extends State<ChatPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(c.name, style: const TextStyle(fontSize: 17)),
-                    Text(typing ? 'en train d\'écrire…' : 'en ligne',
+                    Text(c.name,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 17)),
+                    Text(
+                        typing
+                            ? (brain.typingName[c.id] != null
+                                ? '${brain.typingName[c.id]} écrit…'
+                                : 'en train d\'écrire…')
+                            : (c.isGroup
+                                ? brain.membersOf(c).map((m) => m.name).join(', ')
+                                : 'en ligne'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                             fontSize: 12, fontWeight: FontWeight.normal)),
                   ],
@@ -1684,14 +2584,20 @@ class _ChatPageState extends State<ChatPage> {
               ),
             ]),
             actions: [
+              IconButton(
+                tooltip: 'Rechercher',
+                icon: const Icon(Icons.search),
+                onPressed: () => setState(() => _searching = true),
+              ),
               PopupMenuButton<String>(
                 onSelected: (v) {
                   if (v == 'edit') {
                     Navigator.push(
                         context,
                         MaterialPageRoute(
-                            builder: (_) =>
-                                ContactEditPage(brain: brain, contact: c)));
+                            builder: (_) => editPageFor(brain, c)));
+                  } else if (v == 'speak') {
+                    brain.setAutoSpeak(c, !c.autoSpeak);
                   } else if (v == 'memory') {
                     _memoryDialog();
                   } else if (v == 'clear') {
@@ -1708,17 +2614,30 @@ class _ChatPageState extends State<ChatPage> {
                             builder: (_) => ModelsPage(brain: brain)));
                   }
                 },
-                itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'edit', child: Text('Modifier le contact')),
-                  PopupMenuItem(value: 'memory', child: Text('Mémoire')),
-                  PopupMenuItem(value: 'models', child: Text('Modèles IA')),
-                  PopupMenuItem(value: 'export', child: Text('Exporter (copier)')),
-                  PopupMenuItem(value: 'clear', child: Text('Vider la discussion')),
+                itemBuilder: (_) => [
+                  PopupMenuItem(
+                      value: 'edit',
+                      child: Text(c.isGroup
+                          ? 'Modifier le groupe'
+                          : 'Modifier le contact')),
+                  if (!c.isGroup)
+                    const PopupMenuItem(value: 'memory', child: Text('Mémoire')),
+                  CheckedPopupMenuItem(
+                      value: 'speak',
+                      checked: c.autoSpeak,
+                      child: const Text('Lire les messages à voix haute')),
+                  const PopupMenuItem(value: 'models', child: Text('Modèles IA')),
+                  const PopupMenuItem(
+                      value: 'export', child: Text('Exporter (copier)')),
+                  const PopupMenuItem(
+                      value: 'clear', child: Text('Vider la discussion')),
                 ],
               ),
             ],
           ),
-          body: Container(
+          body: _searching
+              ? _searchResults()
+              : Container(
             color: _dark(context) ? const Color(0xFF0B141A) : _chatBg,
             child: Column(
               children: [
@@ -1779,12 +2698,28 @@ class _ChatPageState extends State<ChatPage> {
                           ),
                         ),
                         const SizedBox(width: 6),
-                        CircleAvatar(
-                          backgroundColor: _waGreen,
-                          child: IconButton(
-                            icon: const Icon(Icons.send, color: Colors.white),
-                            onPressed: typing ? null : _send,
-                          ),
+                        ValueListenableBuilder<TextEditingValue>(
+                          valueListenable: _ctrl,
+                          builder: (context, v, _) {
+                            final mic = v.text.trim().isEmpty || _listening;
+                            return CircleAvatar(
+                              backgroundColor:
+                                  _listening ? Colors.red : _waGreen,
+                              child: IconButton(
+                                tooltip: mic
+                                    ? (_listening ? 'Arrêter' : 'Dicter')
+                                    : 'Envoyer',
+                                icon: Icon(
+                                    mic
+                                        ? (_listening ? Icons.stop : Icons.mic)
+                                        : Icons.send,
+                                    color: Colors.white),
+                                onPressed: mic
+                                    ? _toggleMic
+                                    : (typing ? null : _send),
+                              ),
+                            );
+                          },
                         ),
                       ],
                     ),
@@ -1846,6 +2781,16 @@ class _ChatPageState extends State<ChatPage> {
                   duration: Duration(seconds: 1)));
             },
           ),
+          if (!m.fromMe)
+            ListTile(
+              leading: const Icon(Icons.volume_up),
+              title: const Text('Écouter'),
+              onTap: () {
+                Navigator.pop(ctx);
+                Voice.stop();
+                Voice.speak(m.text, pitch: (brain.byId(m.from) ?? c).pitch);
+              },
+            ),
           if (m.fromMe)
             ListTile(
               leading: const Icon(Icons.edit),
@@ -1967,11 +2912,19 @@ class _ChatPageState extends State<ChatPage> {
       );
 
   Widget _bubble(Msg m) {
+    final author = (c.isGroup && !m.fromMe) ? brain.byId(m.from) : null;
     return Align(
+      key: _keys.putIfAbsent(m, GlobalKey.new),
       alignment: m.fromMe ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
         onLongPress: () => _msgMenu(m),
-        child: Container(
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          foregroundDecoration: identical(_highlight, m)
+              ? BoxDecoration(
+                  color: Colors.amber.withValues(alpha: 0.35),
+                  borderRadius: BorderRadius.circular(12))
+              : null,
           margin: const EdgeInsets.symmetric(vertical: 3),
           padding: const EdgeInsets.fromLTRB(10, 7, 10, 5),
           constraints: BoxConstraints(
@@ -1991,6 +2944,18 @@ class _ChatPageState extends State<ChatPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
+              if (c.isGroup && !m.fromMe)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(bottom: 2),
+                    child: Text(author?.name ?? 'Ancien membre',
+                        style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: Color(author?.color ?? 0xFF888888))),
+                  ),
+                ),
               Align(
                   alignment: Alignment.centerLeft,
                   child: Text(m.text,
@@ -2174,8 +3139,9 @@ class _ModelsPageState extends State<ModelsPage> {
               const SizedBox(height: 24),
               const Text(
                 'Les modèles tournent 100 % sur ton téléphone. '
-                'Un modèle non censuré n\'applique aucun filtre : '
-                'les personnages restent des adultes (18 ans et +).',
+                'Un modèle non censuré n\'applique aucun filtre de lui-même : '
+                'les personnages de moins de 18 ans reçoivent des règles '
+                'strictes (aucun contenu sexuel ou romantique).',
                 style: TextStyle(color: Colors.black54, fontSize: 12),
               ),
             ],
