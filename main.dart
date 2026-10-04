@@ -1014,7 +1014,7 @@ const scenarios = <Scenario>[
     emoji: '🐉',
     pitch: 'Fantasy · une rumeur de trésor circule…',
     character: 'Maître Brann',
-    physical: 'grand et large d'épaules, barbe grise, cicatrice à la joue, tablier de cuir',
+    physical: 'grand et large d\'épaules, barbe grise, cicatrice à la joue, tablier de cuir',
     age: 45,
     persona: 'tavernier bourru au grand cœur, ancien aventurier, '
         'connaît tous les secrets de la région',
