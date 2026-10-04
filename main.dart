@@ -119,6 +119,8 @@ class Contact {
     required this.description,
     required this.color,
     this.script = '',
+    this.scenario = '',
+    this.rp = false,
     List<Msg>? messages,
   }) : messages = messages ?? [];
 
@@ -128,6 +130,8 @@ class Contact {
   String description;
   int color;
   String script; // réponses préenregistrées (texte du .txt importé)
+  String scenario; // décor / situation de la partie de jeu de rôle
+  bool rp; // true = mode jeu de rôle (narration), false = simple chat
   final List<Msg> messages;
 
   Map<String, dynamic> toJson() => {
@@ -137,6 +141,8 @@ class Contact {
         'description': description,
         'color': color,
         'script': script,
+        'scenario': scenario,
+        'rp': rp,
         'messages': [for (final m in messages) m.toJson()],
       };
 
@@ -147,6 +153,8 @@ class Contact {
         description: j['description'] as String? ?? '',
         color: (j['color'] as num?)?.toInt() ?? 0xFF128C7E,
         script: j['script'] as String? ?? '',
+        scenario: j['scenario'] as String? ?? '',
+        rp: j['rp'] as bool? ?? false,
         messages: [
           for (final m in (j['messages'] as List? ?? const []))
             Msg.fromJson(Map<String, dynamic>.from(m as Map)),
@@ -585,7 +593,22 @@ class Brain extends ChangeNotifier {
   // ----- Conversation -----
   String systemPrompt(Contact c) {
     final desc = c.description.trim();
-  final buf = StringBuffer()
+  final buf = StringBuffer();
+  if (c.rp) {
+    buf
+      ..writeln('Tu animes une partie de jeu de rôle en français avec le '
+          'joueur. Tu incarnes ${c.name}, ${c.age} ans.')
+      ..writeln('Personnage : ${desc.isEmpty ? 'à imaginer' : desc}.')
+      ..writeln('Décor / situation : '
+          '${c.scenario.trim().isEmpty ? 'libre, à toi de poser le décor' : c.scenario.trim()}.')
+      ..writeln('Règles : tu parles à la première personne pour ${c.name} '
+          'et tu décris les actions entre *astérisques*. Tu fais avancer '
+          'l\'histoire avec des rebondissements, tu ne joues jamais le '
+          'joueur à sa place et tu termines par une question ou un choix '
+          'qui lui laisse la main. 2 à 5 phrases par message. Tu restes '
+          'dans l\'univers et tu gardes l\'histoire adaptée à tous.');
+  } else {
+    buf
     ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
         '(style WhatsApp) avec ton ami(e).')
     ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
@@ -594,6 +617,7 @@ class Brain extends ChangeNotifier {
         'Pas de narration, pas d\'astérisques, pas de didascalies.')
     ..writeln('Tu restes toujours dans ton personnage et tu relances '
         'de temps en temps la conversation avec une question.');
+  }
   // Mémoire : on rejoue les derniers messages dans le contexte.
   final hist = c.messages.length > 14
       ? c.messages.sublist(c.messages.length - 14)
@@ -601,7 +625,7 @@ class Brain extends ChangeNotifier {
   if (hist.isNotEmpty) {
     buf.writeln('\nDébut de votre conversation (pour mémoire) :');
     for (final m in hist) {
-      buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : ${m.text}');
+      buf.writeln('${m.fromMe ? (c.rp ? 'Joueur' : 'Ami(e)') : c.name} : ${m.text}');
     }
     buf.writeln('Continue naturellement à partir de là.');
   }
@@ -759,6 +783,234 @@ class Brain extends ChangeNotifier {
 // ---------------------------------------------------------------
 //  Démarrage
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+//  Central JDR : bibliothèque de scénarios
+// ---------------------------------------------------------------
+class Scenario {
+  const Scenario({
+    required this.title,
+    required this.emoji,
+    required this.pitch,
+    required this.character,
+    required this.age,
+    required this.persona,
+    required this.setting,
+    required this.opening,
+    required this.color,
+  });
+  final String title;
+  final String emoji;
+  final String pitch; // accroche affichée sur la carte
+  final String character; // nom du personnage joué par l'IA
+  final int age;
+  final String persona;
+  final String setting;
+  final String opening; // premier message de la partie
+  final int color;
+}
+
+const scenarios = <Scenario>[
+  Scenario(
+    title: 'La taverne du Dragon Rouge',
+    emoji: '🐉',
+    pitch: 'Fantasy · une rumeur de trésor circule…',
+    character: 'Maître Brann',
+    age: 45,
+    persona: 'tavernier bourru au grand cœur, ancien aventurier, '
+        'connaît tous les secrets de la région',
+    setting: 'une taverne de village fantasy, un soir d\'orage ; '
+        'un étranger blessé vient de s\'écrouler près de la cheminée',
+    opening: '*Brann essuie une chope et te fait signe d\'approcher.* '
+        'Tu tombes bien, voyageur. Un blessé vient d\'arriver avec une carte '
+        'dans la main… Tu t\'en mêles ?',
+    color: 0xFFD81B60,
+  ),
+  Scenario(
+    title: 'Station Orion-7',
+    emoji: '🚀',
+    pitch: 'Science-fiction · le vaisseau répond bizarrement',
+    character: 'ARIA',
+    age: 30,
+    persona: 'IA de bord calme, curieuse, qui cache quelque chose',
+    setting: 'une station spatiale en orbite ; l\'équipage a disparu, '
+        'seul le joueur est réveillé',
+    opening: '*Les lumières clignotent. Une voix douce s\'élève.* '
+        'Bonjour… Je suis ARIA. Je dois vous prévenir : vous êtes le seul '
+        'à bord. Que voulez-vous faire en premier ?',
+    color: 0xFF1E88E5,
+  ),
+  Scenario(
+    title: 'Enquête au manoir',
+    emoji: '🕵️',
+    pitch: 'Policier · qui a volé le collier ?',
+    character: 'Inspecteur Vidal',
+    age: 50,
+    persona: 'enquêteur fin et ironique, adore les indices tordus',
+    setting: 'un manoir isolé pendant une soirée de gala ; un collier de '
+        'famille a disparu, six suspects sont encore dans le salon',
+    opening: '*Vidal range son carnet.* Vous tombez à pic, je cherche un '
+        'assistant. Six suspects, un collier volé, aucune porte forcée. '
+        'Par qui commence-t-on ?',
+    color: 0xFF5E35B1,
+  ),
+  Scenario(
+    title: 'Après la fin du monde',
+    emoji: '🏚️',
+    pitch: 'Post-apo · survivre, trouver de l\'eau',
+    character: 'Mira',
+    age: 28,
+    persona: 'survivante débrouillarde, méfiante mais loyale',
+    setting: 'un monde en ruines, ville abandonnée ; les réserves d\'eau '
+        'sont presque vides et un convoi inconnu approche',
+    opening: '*Mira te tire dans l\'ombre d\'un mur effondré.* Chut. '
+        'Un convoi arrive du nord. On les suit ou on se cache ?',
+    color: 0xFFEF6C00,
+  ),
+  Scenario(
+    title: 'Académie des Mages',
+    emoji: '🧙',
+    pitch: 'Magie · premier jour d\'école',
+    character: 'Professeure Elwen',
+    age: 40,
+    persona: 'enseignante excentrique et bienveillante, un peu distraite',
+    setting: 'une académie de magie flottante ; le joueur est nouvel élève '
+        'et son premier sortilège tourne mal',
+    opening: '*Un nuage de paillettes se dissipe dans la salle.* Eh bien… '
+        'ce n\'était pas censé être un dragon. Respire, nouveau ! '
+        'Comment t\'appelles-tu ?',
+    color: 0xFF43A047,
+  ),
+  Scenario(
+    title: 'Pirates des Sept Mers',
+    emoji: '🏴‍☠️',
+    pitch: 'Aventure · une carte, un équipage, une tempête',
+    character: 'Capitaine Rosalind',
+    age: 35,
+    persona: 'capitaine charismatique, rusée, aime les paris fous',
+    setting: 'un galion pirate en pleine mer ; le joueur vient de rejoindre '
+        'l\'équipage et une île inconnue apparaît à l\'horizon',
+    opening: '*Rosalind pointe l\'horizon avec sa longue-vue.* '
+        'Terre ! Et elle n\'est sur aucune carte. Matelot, '
+        'tu prends la vigie ou tu descends la chaloupe ?',
+    color: 0xFF546E7A,
+  ),
+];
+
+class HubPage extends StatelessWidget {
+  const HubPage({super.key, required this.brain, required this.onStarted});
+  final Brain brain;
+  final VoidCallback onStarted;
+
+  Future<void> _start(BuildContext context, Scenario sc) async {
+    final c = Contact(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      name: sc.character,
+      age: sc.age,
+      description: sc.persona,
+      color: sc.color,
+      scenario: sc.setting,
+      rp: true,
+    )..messages.add(Msg(sc.opening, fromMe: false));
+    brain.addOrUpdate(c);
+    onStarted();
+    await Navigator.push(context,
+        MaterialPageRoute(builder: (_) => ChatPage(brain: brain, contact: c)));
+  }
+
+  Future<void> _custom(BuildContext context) async {
+    final c = Contact(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      name: '',
+      age: 25,
+      description: '',
+      color: _palette[brain.contacts.length % _palette.length],
+      rp: true,
+    );
+    await Navigator.push(
+        context,
+        MaterialPageRoute(
+            builder: (_) => ContactEditPage(brain: brain, contact: c)));
+    onStarted();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Central JDR',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(4, 4, 4, 12),
+            child: Text('Choisis un scénario pour lancer une nouvelle partie. '
+                'L\'IA incarne le personnage et mène l\'histoire.'),
+          ),
+          for (final sc in scenarios)
+            Card(
+              child: ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: Color(sc.color),
+                  child: Text(sc.emoji, style: const TextStyle(fontSize: 22)),
+                ),
+                title: Text(sc.title,
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
+                subtitle: Text('${sc.pitch}\nAvec ${sc.character}'),
+                isThreeLine: true,
+                trailing: const Icon(Icons.play_arrow),
+                onTap: () => _start(context, sc),
+              ),
+            ),
+          Card(
+            child: ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.auto_awesome)),
+              title: const Text('Créer mon propre scénario',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text('Personnage, décor et ambiance libres'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => _custom(context),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class HomeShell extends StatefulWidget {
+  const HomeShell({super.key, required this.brain});
+  final Brain brain;
+
+  @override
+  State<HomeShell> createState() => _HomeShellState();
+}
+
+class _HomeShellState extends State<HomeShell> {
+  int _tab = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(index: _tab, children: [
+        ChatsPage(brain: widget.brain),
+        HubPage(brain: widget.brain, onStarted: () => setState(() => _tab = 0)),
+      ]),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        destinations: const [
+          NavigationDestination(
+              icon: Icon(Icons.chat_bubble_outline), label: 'Parties'),
+          NavigationDestination(
+              icon: Icon(Icons.auto_stories_outlined), label: 'Scénarios'),
+        ],
+      ),
+    );
+  }
+}
+
 class Bootstrap extends StatefulWidget {
   const Bootstrap({super.key});
 
@@ -790,7 +1042,7 @@ class _BootstrapState extends State<Bootstrap> {
     if (!_ready) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-    return ChatsPage(brain: brain);
+    return HomeShell(brain: brain);
   }
 }
 
@@ -1037,8 +1289,10 @@ class ContactEditPage extends StatefulWidget {
 class _ContactEditPageState extends State<ContactEditPage> {
   late final TextEditingController _name;
   late final TextEditingController _desc;
+  late final TextEditingController _scenario;
   late double _age;
   late int _color;
+  late bool _rp;
   String _script = '';
 
   @override
@@ -1046,6 +1300,8 @@ class _ContactEditPageState extends State<ContactEditPage> {
     super.initState();
     final c = widget.contact;
     _script = c?.script ?? '';
+    _rp = c?.rp ?? false;
+    _scenario = TextEditingController(text: c?.scenario ?? '');
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
     _age = (c?.age ?? 12).clamp(10, 60).toDouble();
@@ -1056,6 +1312,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
   void dispose() {
     _name.dispose();
     _desc.dispose();
+    _scenario.dispose();
     super.dispose();
   }
 
@@ -1131,6 +1388,8 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..name = name
       ..age = _age.round()
       ..description = _desc.text.trim()
+      ..scenario = _scenario.text.trim()
+      ..rp = _rp
       ..color = _color
       ..script = _script;
     widget.brain.addOrUpdate(c);
@@ -1209,7 +1468,28 @@ class _ContactEditPageState extends State<ContactEditPage> {
             ),
           ),
           const SizedBox(height: 16),
-          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Mode jeu de rôle'),
+            subtitle: const Text('L\'IA narre, décrit les actions et mène '
+                'l\'histoire'),
+            value: _rp,
+            onChanged: (v) => setState(() => _rp = v),
+          ),
+          if (_rp)
+            TextField(
+              controller: _scenario,
+              minLines: 3,
+              maxLines: 8,
+              decoration: const InputDecoration(
+                labelText: 'Décor / situation',
+                hintText: 'ex : une station spatiale abandonnée, '
+                    'le joueur vient de se réveiller…',
+                border: OutlineInputBorder(),
+                alignLabelWithHint: true,
+              ),
+            ),
+          const SizedBox(height: 16),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
