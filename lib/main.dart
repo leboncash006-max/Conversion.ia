@@ -494,7 +494,7 @@ class DebriefScreen extends StatelessWidget {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              '${fmtClock(c.ringAt)} · ${c.sc.nature.label}',
+                              '${fmtClock(c.ringAt)} · ${c.title}',
                               style: const TextStyle(fontWeight: FontWeight.w700),
                             ),
                             Text(c.verdict, style: TextStyle(color: _col(c.score))),

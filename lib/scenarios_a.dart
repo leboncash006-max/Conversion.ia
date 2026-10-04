@@ -43,6 +43,7 @@ List<Scenario> scenariosA() => [
   // ---------------------------------------------- Feu de cuisine
   Scenario(
     id: 'feu_cuisine',
+    title: (c) => 'Feu de ${c.v['type']}',
     nature: Nature.feuCuisine,
     zone: Zone.ville,
     weight: 1.2,
@@ -508,6 +509,7 @@ List<Scenario> scenariosA() => [
   // ---------------------------------------------- Accident autoroute
   Scenario(
     id: 'avp_autoroute',
+    title: (c) => "Accident sur l'A71",
     nature: Nature.avp,
     zone: Zone.autoroute,
     minLevel: 1,
@@ -636,6 +638,7 @@ List<Scenario> scenariosA() => [
   // ---------------------------------------------- Monoxyde de carbone
   Scenario(
     id: 'intox_co',
+    title: (c) => 'Intoxication au monoxyde de carbone',
     nature: Nature.intoxication,
     zone: Zone.ville,
     minLevel: 1,
@@ -697,6 +700,7 @@ List<Scenario> scenariosA() => [
   // ---------------------------------------------- Fuite de gaz
   Scenario(
     id: 'gaz',
+    title: (c) => yes(c, 'explosion') ? 'Fuite de gaz… et explosion' : 'Fuite de gaz',
     nature: Nature.fuiteGaz,
     zone: Zone.centre,
     weight: 0.8,

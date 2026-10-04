@@ -220,6 +220,7 @@ class Scenario {
     required this.ambiance,
     required this.report,
     this.whatHappens,
+    this.title,
   });
 
   final String id;
@@ -251,6 +252,9 @@ class Scenario {
 
   /// Réponse à « Que se passe-t-il exactement ? » si différente de l'ouverture.
   final String Function(Incident c)? whatHappens;
+
+  /// Ce qu'était vraiment l'appel (affiché au débrief).
+  final String Function(Incident c)? title;
 }
 
 class Incident {
@@ -309,6 +313,7 @@ class Incident {
   Map<VType, int> get needs => sc.needs(this);
 
   String get shortLabel => (nature ?? sc.nature).label;
+  String get title => sc.title?.call(this) ?? sc.nature.label;
 
   bool get active => dispatched && !done;
 }

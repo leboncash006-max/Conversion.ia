@@ -172,6 +172,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- Guêpes (ou pas)
   Scenario(
     id: 'guepes',
+    title: (c) => yes(c, 'allergie') ? 'Piqûre de guêpe, choc allergique' : 'Nid de guêpes',
     nature: Nature.animal,
     zone: Zone.ville,
     weight: 0.9,
@@ -245,6 +246,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- Chat dans l'arbre
   Scenario(
     id: 'chat',
+    title: (c) => 'Chat dans un arbre',
     nature: Nature.animal,
     zone: Zone.ville,
     weight: 0.7,
@@ -337,6 +339,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- Enfant, maman inconsciente
   Scenario(
     id: 'enfant_maman',
+    title: (c) => "Maman inconsciente (appel d'enfant)",
     nature: Nature.malaise,
     zone: Zone.ville,
     weight: 0.6,
@@ -394,6 +397,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- Canular d'enfants
   Scenario(
     id: 'canular',
+    title: (c) => "Canular d'enfants",
     nature: Nature.feuHabitation,
     zone: Zone.ville,
     weight: 1.0,
@@ -424,6 +428,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- La pizza
   Scenario(
     id: 'pizza',
+    title: (c) => yes(c, 'vrai') ? 'Appel « pizza » : violences conjugales' : 'Canular « pizza »',
     nature: Nature.blesse,
     zone: Zone.ville,
     minLevel: 1,
@@ -483,6 +488,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- Voisins bruyants (17)
   Scenario(
     id: 'voisins',
+    title: (c) => 'Tapage nocturne (pour le 17)',
     nature: Nature.blesse,
     zone: Zone.centre,
     weight: 0.6,
@@ -513,6 +519,7 @@ List<Scenario> scenariosB() => [
   // ---------------------------------------------- Mal aux dents (15)
   Scenario(
     id: 'dents',
+    title: (c) => 'Rage de dents (pour le 15)',
     nature: Nature.malaise,
     zone: Zone.ville,
     weight: 0.6,

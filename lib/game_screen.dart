@@ -30,6 +30,7 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
   Duration _last = Duration.zero;
   Incident? _selected;
   bool _ended = false;
+  bool _menuOpen = false;
 
   Sim get sim => widget.sim;
 
@@ -49,7 +50,12 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed && !sim.paused) sim.togglePause();
+    if (state == AppLifecycleState.resumed) {
+      // De retour dans l'app : on affiche la pause pour que le joueur reprenne la main.
+      if (sim.paused && !_menuOpen && !sim.over) _pauseMenu();
+    } else if (!sim.paused) {
+      sim.togglePause();
+    }
   }
 
   void _onTick(Duration now) {
@@ -62,6 +68,8 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
     }
     if (sim.over && !_ended) {
       _ended = true;
+      // Ferme les feuilles et dialogues encore ouverts avant le débrief.
+      Navigator.of(context).popUntil((route) => route is! PopupRoute);
       widget.onEnd(sim);
     }
   }
@@ -75,6 +83,8 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _pauseMenu() async {
+    if (_menuOpen) return;
+    _menuOpen = true;
     if (!sim.paused) sim.togglePause();
     final quit = await showDialog<bool>(
       context: context,
@@ -88,6 +98,7 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
         ],
       ),
     );
+    _menuOpen = false;
     if (!mounted) return;
     if (quit == true) {
       Navigator.pop(context);
