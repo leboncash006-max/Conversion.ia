@@ -7,6 +7,8 @@
 //  - Gestionnaire de modèles : Qwen 2.5 1.5B, Qwen 3 0.6B,
 //    un modèle non censuré (abliterated) et un dépôt Hugging Face libre
 //  - Choix CPU / GPU, temps de réponse affiché
+//  - Photo de profil par contact, mémoire persistante de l'IA,
+//    plusieurs messages d'affilée et temps d'écriture simulé
 // ============================================================
 
 import 'dart:async';
@@ -119,8 +121,14 @@ class Contact {
     required this.description,
     required this.color,
     this.script = '',
+    this.photo,
+    this.length = 1,
+    this.multi = true,
+    this.memoryOn = true,
+    List<String>? memory,
     List<Msg>? messages,
-  }) : messages = messages ?? [];
+  })  : memory = memory ?? [],
+        messages = messages ?? [];
 
   final String id;
   String name;
@@ -128,6 +136,11 @@ class Contact {
   String description;
   int color;
   String script; // réponses préenregistrées (texte du .txt importé)
+  String? photo; // nom du fichier image dans le dossier de l'app
+  int length; // 0 = messages courts, 1 = variable, 2 = longs
+  bool multi; // l'IA peut envoyer plusieurs messages d'affilée
+  bool memoryOn; // l'IA retient des infos d'une session à l'autre
+  List<String> memory; // souvenirs enregistrés par l'IA
   final List<Msg> messages;
 
   Map<String, dynamic> toJson() => {
@@ -137,6 +150,11 @@ class Contact {
         'description': description,
         'color': color,
         'script': script,
+        if (photo != null) 'photo': photo,
+        'length': length,
+        'multi': multi,
+        'memoryOn': memoryOn,
+        'memory': memory,
         'messages': [for (final m in messages) m.toJson()],
       };
 
@@ -147,6 +165,13 @@ class Contact {
         description: j['description'] as String? ?? '',
         color: (j['color'] as num?)?.toInt() ?? 0xFF128C7E,
         script: j['script'] as String? ?? '',
+        photo: j['photo'] as String?,
+        length: (j['length'] as num?)?.toInt() ?? 1,
+        multi: j['multi'] as bool? ?? true,
+        memoryOn: j['memoryOn'] as bool? ?? true,
+        memory: [
+          for (final m in (j['memory'] as List? ?? const [])) m.toString(),
+        ],
         messages: [
           for (final m in (j['messages'] as List? ?? const []))
             Msg.fromJson(Map<String, dynamic>.from(m as Map)),
@@ -281,6 +306,31 @@ const _palette = <int>[
   0xFF546E7A,
 ];
 
+// Dossier de l'app (photos de profil), renseigné au démarrage.
+String _appDirPath = '';
+
+File? _photoFile(String? name) {
+  if (name == null || name.isEmpty || _appDirPath.isEmpty) return null;
+  final f = File('$_appDirPath/$name');
+  return f.existsSync() ? f : null;
+}
+
+void _deletePhoto(String? name) {
+  if (name == null || name.isEmpty || _appDirPath.isEmpty) return;
+  try {
+    final f = File('$_appDirPath/$name');
+    if (f.existsSync()) f.deleteSync();
+  } catch (_) {}
+}
+
+// Vitesse de frappe simulée (caractères / seconde), 0 = désactivée.
+const _typingSpeeds = <int, String>{
+  0: 'Désactivé',
+  40: 'Rapide',
+  20: 'Normal',
+  9: 'Réaliste',
+};
+
 String _hhmm(DateTime t) =>
     '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
 
@@ -304,6 +354,7 @@ class Brain extends ChangeNotifier {
   String modelId = baseModels.first.id;
   LiteLmBackend backend = LiteLmBackend.cpu;
   String customRepo = '';
+  int typingCps = 20; // vitesse de frappe simulée, 0 = instantané
 
   // État modèle
   final Set<String> downloaded = {};
@@ -316,6 +367,8 @@ class Brain extends ChangeNotifier {
   LiteLmEngine? _engine;
   final Map<String, LiteLmConversation> _convs = {};
   final Set<String> generating = {};
+  // Incrémenté quand une discussion est vidée : stoppe une rafale en cours.
+  final Map<String, int> _epoch = {};
 
   late Directory _dir;
   Timer? _saveTimer;
@@ -339,6 +392,7 @@ class Brain extends ChangeNotifier {
 
   Future<void> init() async {
     _dir = await getApplicationSupportDirectory();
+    _appDirPath = _dir.path;
     try {
       if (await _dataFile.exists()) {
         final j = jsonDecode(await _dataFile.readAsString()) as Map;
@@ -347,6 +401,7 @@ class Brain extends ChangeNotifier {
         backend = (j['gpu'] as bool? ?? false)
             ? LiteLmBackend.gpu
             : LiteLmBackend.cpu;
+        typingCps = (j['typingCps'] as num?)?.toInt() ?? typingCps;
         for (final c in (j['contacts'] as List? ?? const [])) {
           contacts.add(Contact.fromJson(Map<String, dynamic>.from(c as Map)));
         }
@@ -376,6 +431,7 @@ class Brain extends ChangeNotifier {
         'modelId': modelId,
         'customRepo': customRepo,
         'gpu': backend == LiteLmBackend.gpu,
+        'typingCps': typingCps,
         'contacts': [for (final c in contacts) c.toJson()],
       }));
     } catch (_) {}
@@ -399,6 +455,8 @@ class Brain extends ChangeNotifier {
 
   void deleteContact(Contact c) {
     contacts.remove(c);
+    _bump(c);
+    _deletePhoto(c.photo);
     _dropConv(c.id);
     _scheduleSave();
     notifyListeners();
@@ -406,10 +464,20 @@ class Brain extends ChangeNotifier {
 
   void clearChat(Contact c) {
     c.messages.clear();
+    _bump(c);
     _dropConv(c.id);
     _scheduleSave();
     notifyListeners();
   }
+
+  void clearMemory(Contact c) {
+    c.memory.clear();
+    _dropConv(c.id);
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void _bump(Contact c) => _epoch[c.id] = (_epoch[c.id] ?? 0) + 1;
 
   void _dropConv(String id) {
     final conv = _convs.remove(id);
@@ -425,6 +493,12 @@ class Brain extends ChangeNotifier {
 
   void setBackend(LiteLmBackend b) {
     backend = b;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setTypingCps(int v) {
+    typingCps = v;
     _scheduleSave();
     notifyListeners();
   }
@@ -585,29 +659,57 @@ class Brain extends ChangeNotifier {
   // ----- Conversation -----
   String systemPrompt(Contact c) {
     final desc = c.description.trim();
-  final buf = StringBuffer()
-    ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
-        '(style WhatsApp) avec ton ami(e).')
-    ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
-    ..writeln('Tu écris en français, de façon naturelle et spontanée. '
-        'Messages courts (1 à 3 phrases), parfois un emoji. '
-        'Pas de narration, pas d\'astérisques, pas de didascalies.')
-    ..writeln('Tu restes toujours dans ton personnage et tu relances '
-        'de temps en temps la conversation avec une question.');
-  // Mémoire : on rejoue les derniers messages dans le contexte.
-  final hist = c.messages.length > 14
-      ? c.messages.sublist(c.messages.length - 14)
-      : c.messages;
-  if (hist.isNotEmpty) {
-    buf.writeln('\nDébut de votre conversation (pour mémoire) :');
-    for (final m in hist) {
-      buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : ${m.text}');
+    final buf = StringBuffer()
+      ..writeln('Tu es ${c.name}, ${c.age} ans. Tu discutes par messagerie '
+          '(style WhatsApp) avec ton ami(e).')
+      ..writeln('Ton personnage : ${desc.isEmpty ? 'sympa et naturel' : desc}.')
+      ..writeln('Tu écris en français, de façon naturelle et spontanée, '
+          'parfois un emoji. '
+          'Pas de narration, pas d\'astérisques, pas de didascalies.')
+      ..writeln(switch (c.length) {
+        0 => 'Messages courts : 1 à 3 phrases.',
+        2 => 'Tu aimes écrire de longs messages détaillés : plusieurs '
+            'phrases, voire plusieurs paragraphes quand tu racontes ou '
+            'expliques quelque chose.',
+        _ => 'Adapte la longueur : le plus souvent court, mais quand le '
+            'sujet s\'y prête (raconter, expliquer, donner ton avis) tu '
+            'peux écrire un long message de plusieurs phrases.',
+      })
+      ..writeln('Tu restes toujours dans ton personnage et tu relances '
+          'de temps en temps la conversation avec une question.');
+    if (c.multi) {
+      buf.writeln('Comme sur WhatsApp, tu peux envoyer plusieurs messages '
+          'd\'affilée quand c\'est naturel : sépare alors chaque message par '
+          'une ligne contenant uniquement ---. Pas plus de 4 messages.');
     }
-    buf.writeln('Continue naturellement à partir de là.');
+    if (c.memoryOn) {
+      buf.writeln('Mémoire : quand ton ami(e) te dit quelque chose d\'important '
+          'à retenir (prénom, goûts, projets, événements, promesses…), '
+          'ajoute tout à la fin de ta réponse une ligne '
+          '[MÉMO: info courte]. Cette ligne est invisible pour ton ami(e). '
+          'Ne note que des infos nouvelles.');
+      if (c.memory.isNotEmpty) {
+        buf.writeln('\nCe dont tu te souviens sur ton ami(e) :');
+        for (final m in c.memory) {
+          buf.writeln('- $m');
+        }
+      }
+    }
+    // Contexte récent : on rejoue les derniers messages.
+    final hist = c.messages.length > 20
+        ? c.messages.sublist(c.messages.length - 20)
+        : c.messages;
+    if (hist.isNotEmpty) {
+      buf.writeln('\nDébut de votre conversation (pour mémoire) :');
+      for (final m in hist) {
+        final t = m.text.length > 300 ? '${m.text.substring(0, 300)}…' : m.text;
+        buf.writeln('${m.fromMe ? 'Ami(e)' : c.name} : $t');
+      }
+      buf.writeln('Continue naturellement à partir de là.');
+    }
+    return buf.toString();
   }
-  return buf.toString();
-  }
-  
+
   Future<LiteLmConversation> _convFor(Contact c) async {
     final existing = _convs[c.id];
     if (existing != null) return existing;
@@ -641,15 +743,19 @@ class Brain extends ChangeNotifier {
     _scheduleSave();
 
     final sw = Stopwatch()..start();
+    final epoch = _epoch[c.id] ?? 0;
     try {
       if (book != null) {
         // Réponse préenregistrée : pas besoin du modèle IA.
         await Future<void>.delayed(
             Duration(milliseconds: 600 + Random().nextInt(900)));
         final r = book.reply(text);
-        c.messages.add(Msg(
+        await _deliver(
+            c,
             r ?? 'Aucune réponse préenregistrée ne correspond à ce message.',
-            fromMe: false));
+            sw,
+            epoch,
+            timed: false);
         return;
       }
       // La conversation est créée avant l'envoi : l'historique du prompt
@@ -659,10 +765,10 @@ class Brain extends ChangeNotifier {
         final conv = await _convFor(c);
         c.messages.add(last);
         final reply = await conv.sendMessage(text);
-        _addReply(c, reply.text, sw);
+        await _deliver(c, reply.text, sw, epoch);
       } else {
         final reply = await _convs[c.id]!.sendMessage(text);
-        _addReply(c, reply.text, sw);
+        await _deliver(c, reply.text, sw, epoch);
       }
     } catch (e) {
       c.messages.add(Msg('⚠️ Erreur : $e', fromMe: false));
@@ -739,13 +845,68 @@ class Brain extends ChangeNotifier {
     if (await flag.exists()) await flag.delete();
   }
 
-  void _addReply(Contact c, String? raw, Stopwatch sw) {
-    final clean = _clean(raw ?? '');
-    c.messages.add(Msg(
-      clean.isEmpty ? '…' : clean,
-      fromMe: false,
-      seconds: sw.elapsedMilliseconds / 1000,
-    ));
+  // ----- Mémoire, rafales de messages et temps d'écriture -----
+  static final _memoRe = RegExp(
+      r'\[\s*m[ée]mo(?:ire)?\s*:\s*([^\]\n]*)\]?',
+      caseSensitive: false);
+
+  String _extractMemory(Contact c, String text) {
+    for (final m in _memoRe.allMatches(text)) {
+      final info = (m.group(1) ?? '').trim();
+      if (info.isEmpty || !c.memoryOn) continue;
+      final n = ScriptBook.norm(info);
+      if (c.memory.any((e) => ScriptBook.norm(e) == n)) continue;
+      c.memory.add(info);
+    }
+    while (c.memory.length > 60) {
+      c.memory.removeAt(0);
+    }
+    return text.replaceAll(_memoRe, '').trim();
+  }
+
+  static final _sepRe = RegExp(r'^\s*(?:-{3,}|\|{3})\s*$', multiLine: true);
+
+  List<String> _split(String text) => [
+        for (final p in text.split(_sepRe))
+          if (p.trim().isNotEmpty) p.trim(),
+      ];
+
+  // Temps qu'aurait mis une personne à taper ce message.
+  Duration _typingTime(String text) {
+    if (typingCps <= 0) return Duration.zero;
+    final ms = (text.characters.length * 1000 / typingCps).round();
+    return Duration(milliseconds: ms.clamp(700, 30000));
+  }
+
+  Future<void> _deliver(Contact c, String raw, Stopwatch sw, int epoch,
+      {bool timed = true}) async {
+    final genSeconds = sw.elapsedMilliseconds / 1000;
+    final memBefore = c.memory.length;
+    var text = _extractMemory(c, _clean(raw));
+    var parts = _split(text);
+    if (!c.multi && parts.length > 1) parts = [parts.join('\n\n')];
+    if (parts.isEmpty) parts = ['…'];
+    if (c.memory.length != memBefore) _scheduleSave();
+    for (var i = 0; i < parts.length; i++) {
+      final p = parts[i];
+      if (i > 0) {
+        // Petite pause entre deux messages, comme une vraie personne.
+        await Future<void>.delayed(
+            Duration(milliseconds: 400 + Random().nextInt(700)));
+      }
+      // Le temps de génération compte déjà comme temps d'écriture.
+      var wait = _typingTime(p);
+      if (i == 0) wait -= sw.elapsed;
+      if (wait > Duration.zero) await Future<void>.delayed(wait);
+      if ((_epoch[c.id] ?? 0) != epoch || !contacts.contains(c)) return;
+      c.messages.add(Msg(
+        p,
+        fromMe: false,
+        seconds: (timed && i == 0) ? genSeconds : null,
+      ));
+      notifyListeners();
+      _scheduleSave();
+    }
   }
 
   @override
@@ -803,17 +964,50 @@ class Avatar extends StatelessWidget {
   final double radius;
 
   @override
-  Widget build(BuildContext context) => CircleAvatar(
-        radius: radius,
-        backgroundColor: Color(c.color),
-        child: Text(
-          c.name.isEmpty ? '?' : c.name.characters.first.toUpperCase(),
-          style: TextStyle(
-              color: Colors.white,
-              fontSize: radius * 0.9,
-              fontWeight: FontWeight.bold),
-        ),
-      );
+  Widget build(BuildContext context) => AvatarView(
+      name: c.name, color: c.color, photo: c.photo, radius: radius);
+}
+
+class AvatarView extends StatelessWidget {
+  const AvatarView({
+    super.key,
+    required this.name,
+    required this.color,
+    this.photo,
+    this.radius = 24,
+  });
+  final String name;
+  final int color;
+  final String? photo;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    final f = _photoFile(photo);
+    // Décodage à la taille d'affichage (×2 pour garder de la marge au recadrage).
+    final px = (radius * 4 * MediaQuery.of(context).devicePixelRatio).round();
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: Color(color),
+      backgroundImage:
+          f == null
+          ? null
+          : ResizeImage(FileImage(f),
+              width: px, height: px, policy: ResizeImagePolicy.fit),
+      onBackgroundImageError: f == null ? null : (_, __) {},
+      child: f != null
+          ? null
+          : Text(
+              name.trim().isEmpty
+                  ? '?'
+                  : name.trim().characters.first.toUpperCase(),
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: radius * 0.9,
+                  fontWeight: FontWeight.bold),
+            ),
+    );
+  }
 }
 
 class ChatsPage extends StatefulWidget {
@@ -1037,15 +1231,27 @@ class ContactEditPage extends StatefulWidget {
 class _ContactEditPageState extends State<ContactEditPage> {
   late final TextEditingController _name;
   late final TextEditingController _desc;
+  late final TextEditingController _memory;
   late double _age;
   late int _color;
   String _script = '';
+  String? _photo;
+  String? _origPhoto;
+  bool _saved = false;
+  int _length = 1;
+  bool _multi = true;
+  bool _memoryOn = true;
 
   @override
   void initState() {
     super.initState();
     final c = widget.contact;
     _script = c?.script ?? '';
+    _photo = _origPhoto = c?.photo;
+    _length = c?.length ?? 1;
+    _multi = c?.multi ?? true;
+    _memoryOn = c?.memoryOn ?? true;
+    _memory = TextEditingController(text: c?.memory.join('\n') ?? '');
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
     _age = (c?.age ?? 12).clamp(10, 60).toDouble();
@@ -1056,6 +1262,9 @@ class _ContactEditPageState extends State<ContactEditPage> {
   void dispose() {
     _name.dispose();
     _desc.dispose();
+    _memory.dispose();
+    // Photo choisie puis abandonnée : on ne garde pas le fichier.
+    if (!_saved && _photo != _origPhoto) _deletePhoto(_photo);
     super.dispose();
   }
 
@@ -1088,6 +1297,55 @@ class _ContactEditPageState extends State<ContactEditPage> {
     }
   }
 
+  Future<void> _pickPhoto() async {
+    try {
+      final res = await FilePicker.platform
+          .pickFiles(type: FileType.image, withData: true);
+      if (res == null || res.files.isEmpty) return;
+      final f = res.files.first;
+      List<int>? bytes = f.bytes;
+      if (bytes == null && f.path != null) {
+        bytes = await File(f.path!).readAsBytes();
+      }
+      if (bytes == null) throw Exception('image illisible');
+      final ext = (f.extension ?? 'jpg').toLowerCase();
+      final name = 'avatar_${DateTime.now().microsecondsSinceEpoch}.$ext';
+      await File('$_appDirPath/$name').writeAsBytes(bytes);
+      if (_photo != _origPhoto) _deletePhoto(_photo);
+      if (mounted) setState(() => _photo = name);
+    } catch (e) {
+      _snack('Erreur photo : $e');
+    }
+  }
+
+  void _photoMenu() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.photo_library),
+            title: const Text('Choisir une photo'),
+            onTap: () {
+              Navigator.pop(ctx);
+              _pickPhoto();
+            },
+          ),
+          if (_photo != null)
+            ListTile(
+              leading: const Icon(Icons.hide_image, color: Colors.red),
+              title: const Text('Retirer la photo'),
+              onTap: () {
+                Navigator.pop(ctx);
+                if (_photo != _origPhoto) _deletePhoto(_photo);
+                setState(() => _photo = null);
+              },
+            ),
+        ]),
+      ),
+    );
+  }
+
   void _scriptHelp() {
     showDialog<void>(
       context: context,
@@ -1104,6 +1362,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
             '• Droite : une ou plusieurs réponses séparées par | '
             '(une est tirée au hasard)\n'
             '• \\n = retour à la ligne dans une réponse\n'
+            '• \\n---\\n = envoyer la suite dans un 2e message\n'
             '• La ligne « * » sert quand rien ne correspond\n'
             '• Majuscules, accents et ponctuation sont ignorés',
           ),
@@ -1132,7 +1391,17 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..age = _age.round()
       ..description = _desc.text.trim()
       ..color = _color
-      ..script = _script;
+      ..script = _script
+      ..photo = _photo
+      ..length = _length
+      ..multi = _multi
+      ..memoryOn = _memoryOn
+      ..memory = [
+        for (final l in _memory.text.split('\n'))
+          if (l.trim().isNotEmpty) l.trim(),
+      ];
+    if (_origPhoto != _photo) _deletePhoto(_origPhoto);
+    _saved = true;
     widget.brain.addOrUpdate(c);
     Navigator.pop(context);
   }
@@ -1150,15 +1419,33 @@ class _ContactEditPageState extends State<ContactEditPage> {
         padding: const EdgeInsets.all(16),
         children: [
           Center(
-            child: CircleAvatar(
-              radius: 40,
-              backgroundColor: Color(_color),
-              child: Text(
-                _name.text.trim().isEmpty
-                    ? '?'
-                    : _name.text.trim().characters.first.toUpperCase(),
-                style: const TextStyle(fontSize: 36, color: Colors.white),
-              ),
+            child: GestureDetector(
+              onTap: _photoMenu,
+              child: Stack(children: [
+                AvatarView(
+                    name: _name.text,
+                    color: _color,
+                    photo: _photo,
+                    radius: 48),
+                Positioned(
+                  right: 0,
+                  bottom: 0,
+                  child: CircleAvatar(
+                    radius: 16,
+                    backgroundColor: _waLight,
+                    child: const Icon(Icons.photo_camera,
+                        size: 18, color: Colors.white),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+          Center(
+            child: TextButton(
+              onPressed: _photoMenu,
+              child: Text(_photo == null
+                  ? 'Ajouter une photo'
+                  : 'Changer la photo'),
             ),
           ),
           const SizedBox(height: 12),
@@ -1209,6 +1496,73 @@ class _ContactEditPageState extends State<ContactEditPage> {
             ),
           ),
           const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Façon d\'écrire',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  SegmentedButton<int>(
+                    segments: const [
+                      ButtonSegment(value: 0, label: Text('Courts')),
+                      ButtonSegment(value: 1, label: Text('Variables')),
+                      ButtonSegment(value: 2, label: Text('Longs')),
+                    ],
+                    selected: {_length},
+                    onSelectionChanged: (v) =>
+                        setState(() => _length = v.first),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Plusieurs messages d\'affilée'),
+                    subtitle: const Text(
+                        'L\'IA peut découper sa réponse en plusieurs bulles'),
+                    value: _multi,
+                    onChanged: (v) => setState(() => _multi = v),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Mémoire',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: const Text('L\'IA retient ce que tu lui dis '
+                        'et s\'en souvient dans les prochaines discussions'),
+                    value: _memoryOn,
+                    onChanged: (v) => setState(() => _memoryOn = v),
+                  ),
+                  TextField(
+                    controller: _memory,
+                    minLines: 3,
+                    maxLines: 10,
+                    decoration: InputDecoration(
+                      labelText: 'Souvenirs (un par ligne)',
+                      hintText: 'ex : s\'appelle Lucas\naime le basket',
+                      border: const OutlineInputBorder(),
+                      alignLabelWithHint: true,
+                      suffixIcon: IconButton(
+                        tooltip: 'Tout effacer',
+                        icon: const Icon(Icons.delete_sweep),
+                        onPressed: () => setState(_memory.clear),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
           const SizedBox(height: 8),
           Card(
             child: Padding(
@@ -1338,6 +1692,8 @@ class _ChatPageState extends State<ChatPage> {
                         MaterialPageRoute(
                             builder: (_) =>
                                 ContactEditPage(brain: brain, contact: c)));
+                  } else if (v == 'memory') {
+                    _memoryDialog();
                   } else if (v == 'clear') {
                     brain.clearChat(c);
                   } else if (v == 'export') {
@@ -1354,6 +1710,7 @@ class _ChatPageState extends State<ChatPage> {
                 },
                 itemBuilder: (_) => const [
                   PopupMenuItem(value: 'edit', child: Text('Modifier le contact')),
+                  PopupMenuItem(value: 'memory', child: Text('Mémoire')),
                   PopupMenuItem(value: 'models', child: Text('Modèles IA')),
                   PopupMenuItem(value: 'export', child: Text('Exporter (copier)')),
                   PopupMenuItem(value: 'clear', child: Text('Vider la discussion')),
@@ -1516,6 +1873,53 @@ class _ChatPageState extends State<ChatPage> {
             },
           ),
         ]),
+      ),
+    );
+  }
+
+  void _memoryDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => ListenableBuilder(
+        listenable: brain,
+        builder: (ctx, _) => AlertDialog(
+          title: Text('Mémoire de ${c.name}'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: c.memory.isEmpty
+                ? Text(c.memoryOn
+                    ? 'Rien pour l\'instant. Raconte-lui des choses sur toi, '
+                        'il/elle notera ce qui est important.'
+                    : 'La mémoire est désactivée pour ce contact.')
+                : ListView(shrinkWrap: true, children: [
+                    for (final m in c.memory)
+                      ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.psychology, size: 20),
+                        title: Text(m),
+                      ),
+                  ]),
+          ),
+          actions: [
+            if (c.memory.isNotEmpty)
+              TextButton(
+                  onPressed: () => brain.clearMemory(c),
+                  child: const Text('Tout oublier')),
+            TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) =>
+                              ContactEditPage(brain: brain, contact: c)));
+                },
+                child: const Text('Modifier')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+          ],
+        ),
       ),
     );
   }
@@ -1727,6 +2131,25 @@ class _ModelsPageState extends State<ModelsPage> {
                 selected: {b.backend},
                 onSelectionChanged:
                     busy ? null : (s) => b.setBackend(s.first),
+              ),
+              const SizedBox(height: 24),
+              const Text('Temps d\'écriture simulé',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              const Text(
+                  'Plus un message est long, plus « en train d\'écrire… » '
+                  'dure, comme une vraie personne.',
+                  style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 8),
+              SegmentedButton<int>(
+                segments: [
+                  for (final e in _typingSpeeds.entries)
+                    ButtonSegment(value: e.key, label: Text(e.value)),
+                ],
+                selected: {
+                  _typingSpeeds.containsKey(b.typingCps) ? b.typingCps : 20
+                },
+                onSelectionChanged: (v) => b.setTypingCps(v.first),
               ),
               const SizedBox(height: 24),
               FilledButton.icon(
