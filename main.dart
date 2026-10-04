@@ -856,6 +856,12 @@ class Brain extends ChangeNotifier {
       ..writeln('RÈGLES STRICTES (à respecter à chaque message) :')
       ..writeln('- Message très court : 1 phrase, 2 maximum, en général moins '
           'de 15 mots. JAMAIS de paragraphe ni de longue explication.')
+      ..writeln('- Comme sur une vraie messagerie, tu peux envoyer plusieurs '
+          'messages d\'affilée : mets chaque message sur sa propre ligne. '
+          'Le plus souvent un seul, parfois 2 ou 3 très courts '
+          '(ex. « attends » puis « jsuis dans le bus »).')
+      ..writeln('- Si la personne t\'a envoyé plusieurs messages à la suite, '
+          'tu réponds à l\'ensemble d\'un coup, naturellement.')
       ..writeln('- Style texto naturel pour ${c.age} ans : peu de ponctuation, '
           'minuscules acceptées, abréviations (slt, tkt, mdr, jsp, pq, cv, '
           'pk, ptdr), emoji rare.')
@@ -1067,46 +1073,85 @@ class Brain extends ChangeNotifier {
     }
   }
 
+  // Le joueur peut envoyer plusieurs messages d'affilée : le contact attend
+  // qu'il ait fini (petite pause), puis répond à l'ensemble.
+  final Map<String, Timer> _waitMore = {};
+  final Map<String, int> _rev = {};
+  final Map<String, int> _keepAt = {};
+
   Future<void> send(Contact c, String text) async {
-    final book = _bookFor(c);
-    if (!canReply(c) || generating.contains(c.id)) return;
+    if (!canReply(c)) return;
     // Si le contact était parti, il revient à l'heure prévue et répond à tout.
-    final keepAt = (c.pending.isNotEmpty && c.pending.first.away)
-        ? c.pending.first.at
-        : null;
+    if (c.pending.isNotEmpty && c.pending.first.away) {
+      _keepAt[c.id] = c.pending.first.at;
+    }
     _dropPending(c);
     c.messages.add(Msg(text, fromMe: true));
-    generating.add(c.id);
+    _rev[c.id] = (_rev[c.id] ?? 0) + 1;
     notifyListeners();
     _scheduleSave();
+    _waitMore[c.id]?.cancel();
+    _waitMore[c.id] = Timer(
+        Duration(milliseconds: 2500 + Random().nextInt(1500)),
+        () => unawaited(_reply(c)));
+  }
+
+  List<String> _unanswered(Contact c) {
+    final out = <String>[];
+    for (var i = c.messages.length - 1; i >= 0 && c.messages[i].fromMe; i--) {
+      out.insert(0, c.messages[i].text);
+    }
+    return out;
+  }
+
+  Future<void> _reply(Contact c) async {
+    _waitMore.remove(c.id);
+    // Une génération est déjà en cours : elle verra les nouveaux messages.
+    if (generating.contains(c.id)) return;
+    final asked = _unanswered(c);
+    if (asked.isEmpty) return;
+    final rev = _rev[c.id];
+    generating.add(c.id);
+    notifyListeners();
 
     final sw = Stopwatch()..start();
+    var again = false;
     try {
+      final book = _bookFor(c);
+      String? raw;
       if (book != null) {
         // Réponse préenregistrée : pas besoin du modèle IA.
         await Future<void>.delayed(
             Duration(milliseconds: 600 + Random().nextInt(900)));
-        final r = book.reply(text);
-        c.messages.add(Msg(
-            r ?? 'Aucune réponse préenregistrée ne correspond à ce message.',
-            fromMe: false));
-        return;
-      }
-      if (onlineOk) {
-        _addReply(c, await _askOnline(c), sw, keepAt: keepAt);
-        return;
-      }
-      // La conversation est créée avant l'envoi : l'historique du prompt
-      // ne doit pas contenir le message en cours.
-      if (!_convs.containsKey(c.id)) {
-        final last = c.messages.removeLast();
-        final conv = await _convFor(c);
-        c.messages.add(last);
-        final reply = await conv.sendMessage(text);
-        _addReply(c, reply.text, sw);
+        raw = book.reply(asked.last) ??
+            'Aucune réponse préenregistrée ne correspond à ce message.';
+      } else if (onlineOk) {
+        raw = await _askOnline(c);
       } else {
-        final reply = await _convs[c.id]!.sendMessage(text);
-        _addReply(c, reply.text, sw);
+        // La conversation est créée avant l'envoi : l'historique du prompt
+        // ne doit pas contenir les messages en cours.
+        if (!_convs.containsKey(c.id)) {
+          final tail = c.messages.sublist(c.messages.length - asked.length);
+          c.messages.removeRange(c.messages.length - asked.length, c.messages.length);
+          try {
+            await _convFor(c);
+          } finally {
+            c.messages.addAll(tail);
+          }
+        }
+        raw = (await _convs[c.id]!.sendMessage(asked.join('\n'))).text;
+      }
+      if (_rev[c.id] != rev) {
+        // Le joueur a écrit entre-temps : on répond plutôt à tout d'un coup.
+        if (!onlineOk && book == null) _dropConv(c.id);
+        again = true;
+        return;
+      }
+      if (book != null) {
+        c.messages.add(Msg(raw ?? '', fromMe: false));
+      } else {
+        final keepAt = _keepAt.remove(c.id);
+        _addReply(c, raw, sw, keepAt: keepAt);
       }
     } catch (e) {
       c.messages.add(Msg('⚠️ Erreur : $e', fromMe: false));
@@ -1114,7 +1159,11 @@ class Brain extends ChangeNotifier {
       generating.remove(c.id);
       notifyListeners();
       _scheduleSave();
-      unawaited(_maybeSummarize(c));
+      if (again && _waitMore[c.id] == null) {
+        unawaited(_reply(c));
+      } else if (!again) {
+        unawaited(_maybeSummarize(c));
+      }
     }
   }
 
@@ -1327,7 +1376,7 @@ class Brain extends ChangeNotifier {
         for (final l in clean.split(RegExp(r'\n+')))
           if (l.trim().isNotEmpty) l.trim(),
       ];
-      if (lines.isNotEmpty) parts = lines.take(3).toList();
+      if (lines.isNotEmpty) parts = lines.take(4).toList();
     }
     _queueReply(c, parts, secs, keepAt);
   }
@@ -1336,6 +1385,9 @@ class Brain extends ChangeNotifier {
   void dispose() {
     _ticker?.cancel();
     _saveTimer?.cancel();
+    for (final t in _waitMore.values) {
+      t.cancel();
+    }
     unload();
     super.dispose();
   }
@@ -2319,7 +2371,7 @@ class _ChatPageState extends State<ChatPage> {
                           backgroundColor: _waGreen,
                           child: IconButton(
                             icon: const Icon(Icons.send, color: Colors.white),
-                            onPressed: typing ? null : _send,
+                            onPressed: _send,
                           ),
                         ),
                       ],
