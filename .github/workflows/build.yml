@@ -19,17 +19,26 @@ jobs:
           channel: stable
       - name: Creer le projet
         run: |
-          flutter create ia_test --platforms=android
-          cp main.dart ia_test/lib/main.dart
-          cd ia_test
-          flutter pub add flutter_litert_lm path_provider file_picker:^10.0.0
-          sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle*
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          flutter create allo18 --platforms=android --org fr.allo18
+          rm -rf allo18/lib allo18/test
+          cp -r lib test allo18/
+          cp -r android_res/. allo18/android/app/src/main/res/
+          cd allo18
+          flutter pub add path_provider
+          sed -i 's/android:label="allo18"/android:label="Allô 18"/' android/app/src/main/AndroidManifest.xml
+      - name: Tester
+        run: |
+          cd allo18
+          flutter analyze
+          flutter test
       - name: Compiler
         run: |
-          cd ia_test
+          cd allo18
           flutter build apk --release --target-platform android-arm64
+          cp build/app/outputs/flutter-apk/app-release.apk ../Allo18.apk
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          files: ia_test/build/app/outputs/flutter-apk/app-release.apk
+          name: Allô 18 · build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          files: Allo18.apk
