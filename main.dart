@@ -1203,7 +1203,7 @@ class Brain extends ChangeNotifier {
       final roll = r.nextDouble();
       if (roll < 0.70) {
         // Il écrit : un temps de frappe proportionnel à la longueur.
-        at = now + min(6000, 1200 + parts.first.length * 45) + r.nextInt(1500);
+        at = now + min<int>(6000, 1200 + parts.first.length * 45) + r.nextInt(1500);
       } else if (roll < 0.95) {
         at = now + (120 + r.nextInt(61)) * 1000; // parti 2 à 3 min
         away = true;
