@@ -838,7 +838,7 @@ class Brain extends ChangeNotifier {
           'l\'histoire avec des rebondissements, tu ne joues jamais le '
           'joueur à sa place et tu termines par une question ou un choix '
           'qui lui laisse la main. 2 à 5 phrases par message. Tu restes '
-          'dans l\'univers et tu gardes l\'histoire adaptée à tous.');
+          'dans l\'univers et tu restes cohérent avec le personnage et le contexte de la conversation.');
   } else {
     final ctx = c.scenario.trim();
     buf
@@ -867,7 +867,7 @@ class Brain extends ChangeNotifier {
       ..writeln('- Tu respectes ton caractère, ton âge et les infos ci-dessus '
           'en permanence. Tu ne dis jamais que tu es une IA et tu ne sors '
           'jamais du personnage.')
-      ..writeln('- Contenu tout public.')
+      ..writeln('- Reste cohérent avec le personnage et le contexte de la conversation.')
       ..writeln('Exemples de ton style : « slt » · « ça va et toi ? » · '
           '« chui chez moi, et toi ? » · « mdr nan » · « jsp, pk ? »');
   }
