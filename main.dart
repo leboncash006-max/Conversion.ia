@@ -661,7 +661,9 @@ class AudioHub extends ChangeNotifier {
     dur = Duration.zero;
     playing = true;
     notifyListeners();
-    await _p.play(DeviceFileSource(file), position: from);
+    await _p.play(
+        file.startsWith('http') ? UrlSource(file) : DeviceFileSource(file),
+        position: from);
   }
 
   Future<void> seek(String file, double fraction, int totalMs) async {
@@ -1013,6 +1015,63 @@ class Eleven {
     }
   }
 
+  static Future<Map<String, dynamic>> _get(String path) async {
+    final client = HttpClient();
+    try {
+      final req =
+          await client.getUrl(Uri.parse('https://api.elevenlabs.io$path'));
+      req.headers.set('xi-api-key', key);
+      final res = await req.close();
+      final txt = await res.transform(utf8.decoder).join();
+      if (res.statusCode != 200) {
+        var msg = txt;
+        try {
+          final d = (jsonDecode(txt) as Map)['detail'];
+          msg = d is Map ? '${d['message'] ?? d}' : '$d';
+        } catch (_) {}
+        throw ElevenError(res.statusCode, msg);
+      }
+      return Map<String, dynamic>.from(jsonDecode(txt) as Map);
+    } finally {
+      client.close();
+    }
+  }
+
+  /// Voix de la bibliothèque ElevenLabs (partagées par la communauté).
+  static Future<List<ElevenVoice>> library(
+      {String gender = 'female', String age = 'young', String search = ''}) async {
+    final q = [
+      'page_size=40',
+      'language=fr',
+      if (gender.isNotEmpty) 'gender=$gender',
+      if (age.isNotEmpty) 'age=$age',
+      if (search.trim().isNotEmpty)
+        'search=${Uri.encodeQueryComponent(search.trim())}',
+    ].join('&');
+    final j = await _get('/v1/shared-voices?$q');
+    return [
+      for (final v in (j['voices'] as List? ?? const []))
+        ElevenVoice.fromShared(Map<String, dynamic>.from(v as Map)),
+    ];
+  }
+
+  /// Voix déjà disponibles sur le compte (voix par défaut + ajoutées).
+  static Future<List<ElevenVoice>> mine() async {
+    final j = await _get('/v1/voices');
+    return [
+      for (final v in (j['voices'] as List? ?? const []))
+        ElevenVoice.fromMine(Map<String, dynamic>.from(v as Map)),
+    ];
+  }
+
+  /// Ajoute une voix de la bibliothèque au compte. Renvoie son ID.
+  static Future<String> addShared(ElevenVoice v) async {
+    final bytes = await _post(
+        '/v1/voices/add/${v.ownerId}/${v.id}', {'new_name': v.name});
+    return ((jsonDecode(utf8.decode(bytes)) as Map)['voice_id'] as String?) ??
+        v.id;
+  }
+
   /// Fabrique un vocal WAV avec la voix ElevenLabs choisie.
   static Future<({int ms, List<double> wave})> synth(
       String text, String outPath) async {
@@ -1100,6 +1159,41 @@ class Eleven {
   }
 }
 
+class ElevenVoice {
+  ElevenVoice(this.id, this.name, this.info, this.preview, {this.ownerId});
+  final String id;
+  final String name;
+  final String info; // accent, âge, style…
+  final String? preview; // URL d'un extrait audio
+  final String? ownerId; // voix de la bibliothèque : son auteur
+
+  static ElevenVoice fromShared(Map<String, dynamic> v) => ElevenVoice(
+        '${v['voice_id']}',
+        '${v['name'] ?? 'Voix'}',
+        [
+          v['gender'],
+          v['age'],
+          v['accent'],
+          v['descriptive'],
+          v['use_case'],
+        ].where((e) => e != null && '$e'.isNotEmpty).join(' · '),
+        v['preview_url'] as String?,
+        ownerId: v['public_owner_id'] as String?,
+      );
+
+  static ElevenVoice fromMine(Map<String, dynamic> v) {
+    final l = Map<String, dynamic>.from(v['labels'] as Map? ?? const {});
+    return ElevenVoice(
+      '${v['voice_id']}',
+      '${v['name'] ?? 'Voix'}',
+      [l['gender'], l['age'], l['accent'], l['description'], v['category']]
+          .where((e) => e != null && '$e'.isNotEmpty)
+          .join(' · '),
+      v['preview_url'] as String?,
+    );
+  }
+}
+
 class ElevenError implements Exception {
   ElevenError(this.code, this.message);
   final int code;
@@ -1107,6 +1201,9 @@ class ElevenError implements Exception {
   @override
   String toString() => code == 401
       ? 'clé API ElevenLabs refusée'
+      : (code == 403 && message.contains('paid plan'))
+          ? 'cette fonction demande un abonnement ElevenLabs payant. Avec le '
+              'plan gratuit, utilise « Choisir une voix ».'
       : code == 429
           ? 'quota ElevenLabs atteint'
           : 'ElevenLabs ($code) : $message';
@@ -4944,6 +5041,172 @@ class _VoiceBubbleState extends State<VoiceBubble> {
 }
 
 // ---------------------------------------------------------------
+//  Choix d'une voix ElevenLabs existante (fonctionne en plan gratuit)
+// ---------------------------------------------------------------
+class VoicePickerPage extends StatefulWidget {
+  const VoicePickerPage({super.key, required this.brain});
+  final Brain brain;
+
+  @override
+  State<VoicePickerPage> createState() => _VoicePickerPageState();
+}
+
+class _VoicePickerPageState extends State<VoicePickerPage> {
+  bool _library = true; // bibliothèque, sinon mes voix
+  String _age = 'young';
+  final _search = TextEditingController();
+  List<ElevenVoice> _voices = [];
+  bool _busy = false;
+  String _status = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    AudioHub.i.stop();
+    _search.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _busy = true;
+      _status = '';
+      _voices = [];
+    });
+    try {
+      final v = _library
+          ? await Eleven.library(age: _age, search: _search.text)
+          : await Eleven.mine();
+      setState(() {
+        _voices = v;
+        _status = v.isEmpty
+            ? 'Aucune voix trouvée.'
+            : 'Touche ▶ pour écouter, puis « Choisir ».';
+      });
+    } catch (e) {
+      setState(() => _status = 'Erreur : $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _choose(ElevenVoice v) async {
+    setState(() {
+      _busy = true;
+      _status = 'Ajout de « ${v.name} »…';
+    });
+    var id = v.id;
+    var note = '';
+    if (v.ownerId != null) {
+      try {
+        id = await Eleven.addShared(v);
+      } catch (e) {
+        // Déjà ajoutée, ou plan qui ne permet pas l'ajout : on tente
+        // d'utiliser la voix directement par son ID.
+        note = ' (non ajoutée au compte : $e)';
+      }
+    }
+    await widget.brain.setEleven(voiceId: id, name: v.name);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Voix « ${v.name} » choisie$note. Touche « Tester ».')));
+    Navigator.pop(context, id);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Choisir une voix')),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+          child: SegmentedButton<bool>(
+            segments: const [
+              ButtonSegment(value: true, label: Text('Bibliothèque FR')),
+              ButtonSegment(value: false, label: Text('Mes voix')),
+            ],
+            selected: {_library},
+            onSelectionChanged: (v) {
+              setState(() => _library = v.first);
+              _load();
+            },
+          ),
+        ),
+        if (_library)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Row(children: [
+              DropdownButton<String>(
+                value: _age,
+                items: const [
+                  DropdownMenuItem(value: 'young', child: Text('Jeune')),
+                  DropdownMenuItem(value: 'middle_aged', child: Text('Adulte')),
+                  DropdownMenuItem(value: '', child: Text('Tous âges')),
+                ],
+                onChanged: (v) {
+                  setState(() => _age = v ?? 'young');
+                  _load();
+                },
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: _search,
+                  decoration: const InputDecoration(
+                      hintText: 'Recherche (ex : ado, douce…)', isDense: true),
+                  onSubmitted: (_) => _load(),
+                ),
+              ),
+              IconButton(icon: const Icon(Icons.search), onPressed: _load),
+            ]),
+          ),
+        if (_busy) const LinearProgressIndicator(),
+        if (_status.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Text(_status),
+          ),
+        Expanded(
+          child: ListenableBuilder(
+            listenable: AudioHub.i,
+            builder: (context, _) => ListView.separated(
+              itemCount: _voices.length,
+              separatorBuilder: (_, _) => const Divider(height: 1),
+              itemBuilder: (context, i) {
+                final v = _voices[i];
+                final playing =
+                    AudioHub.i.path == v.preview && AudioHub.i.playing;
+                return ListTile(
+                  leading: IconButton(
+                    iconSize: 34,
+                    icon: Icon(playing ? Icons.pause_circle : Icons.play_circle),
+                    onPressed: v.preview == null
+                        ? null
+                        : () => AudioHub.i.toggle(v.preview!),
+                  ),
+                  title: Text(v.name),
+                  subtitle: Text(v.info, maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
+                  trailing: TextButton(
+                    onPressed: _busy ? null : () => _choose(v),
+                    child: const Text('Choisir'),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// ---------------------------------------------------------------
 //  Création d'une voix ElevenLabs (on choisit à l'oreille)
 // ---------------------------------------------------------------
 class VoiceDesignPage extends StatefulWidget {
@@ -5191,6 +5454,19 @@ class _ModelsPageState extends State<ModelsPage> {
                         },
                   icon: const Icon(Icons.auto_awesome),
                   label: const Text('Créer une voix'),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: Eleven.key.isEmpty
+                      ? null
+                      : () async {
+                          final id = await Navigator.push<String>(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) => VoicePickerPage(brain: b)));
+                          if (id != null) _elVoice.text = id;
+                        },
+                  icon: const Icon(Icons.record_voice_over),
+                  label: const Text('Choisir une voix'),
                 ),
                 OutlinedButton.icon(
                   onPressed: Eleven.ready
