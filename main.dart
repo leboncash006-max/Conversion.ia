@@ -312,6 +312,8 @@ class Brain extends ChangeNotifier {
   String modelId = baseModels.first.id;
   LiteLmBackend backend = LiteLmBackend.cpu;
   String customRepo = '';
+  String deepseekKey = ''; // clé API DeepSeek, stockée sur le téléphone
+  bool online = false; // true = répondre via DeepSeek au lieu du modèle local
 
   // État modèle
   final Set<String> downloaded = {};
@@ -340,6 +342,7 @@ class Brain extends ChangeNotifier {
           orElse: () => baseModels.first);
 
   bool get ready => _engine != null;
+  bool get onlineOk => online && deepseekKey.trim().isNotEmpty;
 
   // ----- Stockage -----
   File get _dataFile => File('${_dir.path}/app_data.json');
@@ -352,6 +355,8 @@ class Brain extends ChangeNotifier {
         final j = jsonDecode(await _dataFile.readAsString()) as Map;
         modelId = j['modelId'] as String? ?? modelId;
         customRepo = j['customRepo'] as String? ?? '';
+        deepseekKey = j['deepseekKey'] as String? ?? '';
+        online = j['online'] as bool? ?? false;
         backend = (j['gpu'] as bool? ?? false)
             ? LiteLmBackend.gpu
             : LiteLmBackend.cpu;
@@ -383,6 +388,8 @@ class Brain extends ChangeNotifier {
       await _dataFile.writeAsString(jsonEncode({
         'modelId': modelId,
         'customRepo': customRepo,
+        'deepseekKey': deepseekKey,
+        'online': online,
         'gpu': backend == LiteLmBackend.gpu,
         'contacts': [for (final c in contacts) c.toJson()],
       }));
@@ -433,6 +440,18 @@ class Brain extends ChangeNotifier {
 
   void setBackend(LiteLmBackend b) {
     backend = b;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setDeepseekKey(String v) {
+    deepseekKey = v.trim();
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setOnline(bool v) {
+    online = v;
     _scheduleSave();
     notifyListeners();
   }
@@ -591,7 +610,7 @@ class Brain extends ChangeNotifier {
   }
 
   // ----- Conversation -----
-  String systemPrompt(Contact c) {
+  String systemPrompt(Contact c, {bool withHistory = true}) {
     final desc = c.description.trim();
   final buf = StringBuffer();
   if (c.rp) {
@@ -622,7 +641,7 @@ class Brain extends ChangeNotifier {
   final hist = c.messages.length > 14
       ? c.messages.sublist(c.messages.length - 14)
       : c.messages;
-  if (hist.isNotEmpty) {
+  if (withHistory && hist.isNotEmpty) {
     buf.writeln('\nDébut de votre conversation (pour mémoire) :');
     for (final m in hist) {
       buf.writeln('${m.fromMe ? (c.rp ? 'Joueur' : 'Ami(e)') : c.name} : ${m.text}');
@@ -656,9 +675,43 @@ class Brain extends ChangeNotifier {
     return out.trim();
   }
 
+  // ----- DeepSeek (en ligne) -----
+  Future<String> _askDeepseek(Contact c) async {
+    final msgs = <Map<String, String>>[
+      {'role': 'system', 'content': systemPrompt(c, withHistory: false)},
+      for (final m in c.messages.length > 30
+          ? c.messages.sublist(c.messages.length - 30)
+          : c.messages)
+        {'role': m.fromMe ? 'user' : 'assistant', 'content': m.text},
+    ];
+    final client = HttpClient();
+    try {
+      final req = await client
+          .postUrl(Uri.parse('https://api.deepseek.com/chat/completions'));
+      req.headers
+        ..set(HttpHeaders.contentTypeHeader, 'application/json')
+        ..set(HttpHeaders.authorizationHeader, 'Bearer ${deepseekKey.trim()}');
+      req.add(utf8.encode(jsonEncode({
+        'model': 'deepseek-chat',
+        'messages': msgs,
+        'temperature': c.rp ? 1.1 : 0.9,
+      })));
+      final res = await req.close().timeout(const Duration(seconds: 90));
+      final body = await res.transform(utf8.decoder).join();
+      if (res.statusCode != 200) {
+        throw Exception('DeepSeek ${res.statusCode} : $body');
+      }
+      final j = jsonDecode(body) as Map;
+      return (((j['choices'] as List).first as Map)['message'] as Map)['content']
+          as String;
+    } finally {
+      client.close();
+    }
+  }
+
   Future<void> send(Contact c, String text) async {
     final book = _bookFor(c);
-    if ((book == null && !ready) || generating.contains(c.id)) return;
+    if (!canReply(c) || generating.contains(c.id)) return;
     c.messages.add(Msg(text, fromMe: true));
     generating.add(c.id);
     notifyListeners();
@@ -674,6 +727,10 @@ class Brain extends ChangeNotifier {
         c.messages.add(Msg(
             r ?? 'Aucune réponse préenregistrée ne correspond à ce message.',
             fromMe: false));
+        return;
+      }
+      if (onlineOk) {
+        _addReply(c, await _askDeepseek(c), sw);
         return;
       }
       // La conversation est créée avant l'envoi : l'historique du prompt
@@ -704,7 +761,7 @@ class Brain extends ChangeNotifier {
     return b.isEmpty ? null : b;
   }
 
-  bool canReply(Contact c) => ready || _bookFor(c) != null;
+  bool canReply(Contact c) => onlineOk || ready || _bookFor(c) != null;
 
   // ----- Confort de chat -----
   Future<void> regenerate(Contact c) async {
@@ -1137,7 +1194,7 @@ class _ChatsPageState extends State<ChatsPage> {
           ),
           body: Column(
             children: [
-              if (!brain.ready)
+              if (!brain.ready && !brain.onlineOk)
                 Material(
                   color: Colors.amber.shade100,
                   child: ListTile(
@@ -1905,6 +1962,7 @@ class ModelsPage extends StatefulWidget {
 
 class _ModelsPageState extends State<ModelsPage> {
   late final TextEditingController _repo;
+  late final TextEditingController _key;
 
   Brain get b => widget.brain;
 
@@ -1912,11 +1970,13 @@ class _ModelsPageState extends State<ModelsPage> {
   void initState() {
     super.initState();
     _repo = TextEditingController(text: b.customRepo);
+    _key = TextEditingController(text: b.deepseekKey);
   }
 
   @override
   void dispose() {
     _repo.dispose();
+    _key.dispose();
     super.dispose();
   }
 
@@ -1940,7 +2000,40 @@ class _ModelsPageState extends State<ModelsPage> {
           body: ListView(
             padding: const EdgeInsets.all(16),
             children: [
-              const Text('Modèle',
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('DeepSeek (en ligne)',
+                          style: TextStyle(
+                              fontSize: 18, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _key,
+                        obscureText: true,
+                        onChanged: b.setDeepseekKey,
+                        decoration: const InputDecoration(
+                          labelText: 'Clé API DeepSeek',
+                          helperText: 'Stockée uniquement sur ce téléphone',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Répondre avec DeepSeek'),
+                        subtitle: const Text(
+                            'Nécessite internet ; sinon modèle local'),
+                        value: b.online,
+                        onChanged: b.setOnline,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text('Modèle local',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               RadioGroup<String>(
                 groupValue: b.modelId,
