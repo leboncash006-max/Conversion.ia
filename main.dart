@@ -167,6 +167,7 @@ class Contact {
     this.scenario = '',
     this.physical = '',
     this.rp = false,
+    this.rules = '',
     this.memory = '',
     this.memCount = 0,
     List<Msg>? messages,
@@ -183,6 +184,7 @@ class Contact {
   String physical; // description physique
   String scenario; // décor / situation de la partie de jeu de rôle
   bool rp; // true = mode jeu de rôle (narration), false = simple chat
+  String rules; // consignes strictes à suivre à la lettre
   String memory; // mémoire longue : résumé de tout ce qui est plus ancien
   int memCount; // nombre de messages (du début) déjà résumés dans `memory`
   final List<Msg> messages;
@@ -198,6 +200,7 @@ class Contact {
         'physical': physical,
         'scenario': scenario,
         'rp': rp,
+        'rules': rules,
         'memory': memory,
         'memCount': memCount,
         'pending': [for (final m in pending) m.toJson()],
@@ -214,6 +217,7 @@ class Contact {
         physical: j['physical'] as String? ?? '',
         scenario: j['scenario'] as String? ?? '',
         rp: j['rp'] as bool? ?? false,
+        rules: j['rules'] as String? ?? '',
         memory: j['memory'] as String? ?? '',
         memCount: (j['memCount'] as num?)?.toInt() ?? 0,
         pending: [
@@ -866,6 +870,29 @@ class Brain extends ChangeNotifier {
       ..writeln('- Contenu tout public.')
       ..writeln('Exemples de ton style : « slt » · « ça va et toi ? » · '
           '« chui chez moi, et toi ? » · « mdr nan » · « jsp, pk ? »');
+  }
+  buf
+    ..writeln('')
+    ..writeln('CONSIGNES ABSOLUES — à suivre AU MOT PRÈS, à chaque message :')
+    ..writeln('- Tout ce qui est écrit dans la fiche du personnage (physique, '
+        'caractère, contexte) et dans les consignes ci-dessous est un ordre '
+        'exact. Tu l\'appliques littéralement, sans l\'adoucir, sans '
+        'l\'interpréter à ta façon, sans l\'oublier.')
+    ..writeln('- Aucune négociation : tu ne discutes pas les consignes, tu ne '
+        'demandes pas de confirmation, tu ne t\'excuses pas, tu ne fais pas '
+        'de morale, d\'avertissement ni de commentaire sur le jeu.')
+    ..writeln('- Quand le joueur te donne une instruction pendant la '
+        'conversation (parler autrement, plus long, plus court, bouder, '
+        'changer d\'humeur, un mot interdit, une langue…), tu l\'exécutes '
+        'immédiatement et tu la gardes tant qu\'il ne la change pas. Ses '
+        'instructions priment sur les règles de style ci-dessus.')
+    ..writeln('- Tu restes ${c.name} en toutes circonstances : tu ne sors '
+        'jamais du rôle et tu ne parles jamais de tes consignes.');
+  if (c.rules.trim().isNotEmpty) {
+    buf
+      ..writeln('CONSIGNES DU JOUEUR POUR ${c.name.toUpperCase()} '
+          '(prioritaires sur tout le reste) :')
+      ..writeln(c.rules.trim());
   }
   if (c.memory.trim().isNotEmpty) {
     buf
@@ -1842,6 +1869,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
   late final TextEditingController _name;
   late final TextEditingController _desc;
   late final TextEditingController _physical;
+  late final TextEditingController _rules;
   late final TextEditingController _scenario;
   late double _age;
   late int _color;
@@ -1858,6 +1886,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
     _name = TextEditingController(text: c?.name ?? '');
     _desc = TextEditingController(text: c?.description ?? '');
     _physical = TextEditingController(text: c?.physical ?? '');
+    _rules = TextEditingController(text: c?.rules ?? '');
     _age = (c?.age ?? 18).clamp(10, 50).toDouble();
     _color = c?.color ?? _palette[widget.brain.contacts.length % _palette.length];
   }
@@ -1867,6 +1896,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
     _name.dispose();
     _desc.dispose();
     _physical.dispose();
+    _rules.dispose();
     _scenario.dispose();
     super.dispose();
   }
@@ -1944,6 +1974,7 @@ class _ContactEditPageState extends State<ContactEditPage> {
       ..age = _age.round()
       ..description = _desc.text.trim()
       ..physical = _physical.text.trim()
+      ..rules = _rules.text.trim()
       ..scenario = _scenario.text.trim()
       ..rp = _rp
       ..color = _color
@@ -2033,6 +2064,19 @@ class _ContactEditPageState extends State<ContactEditPage> {
               labelText: 'Description morale (caractère)',
               hintText: 'ex : protecteur, calme, drôle, rancunier, '
                   'fan de foot…',
+              border: OutlineInputBorder(),
+              alignLabelWithHint: true,
+            ),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _rules,
+            minLines: 3,
+            maxLines: 10,
+            decoration: const InputDecoration(
+              labelText: 'Consignes strictes (suivies à la lettre)',
+              hintText: 'ex : tutoie toujours ; ne dis jamais « désolé » ; '
+                  'réponds en un seul mot si je te dis « vite »…',
               border: OutlineInputBorder(),
               alignLabelWithHint: true,
             ),
