@@ -1,0 +1,9 @@
+.dart_tool/
+build/
+.flutter-plugins*
+.packages
+.pub-cache/
+android/
+ios/
+*.iml
+.idea/
