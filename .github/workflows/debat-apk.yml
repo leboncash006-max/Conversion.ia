@@ -7,6 +7,9 @@ on:
       - ".github/workflows/debat-apk.yml"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,7 +37,8 @@ jobs:
       - run: flutter pub get
       - run: flutter analyze
       - run: flutter build apk --release
-      - uses: actions/upload-artifact@v4
+      - uses: softprops/action-gh-release@v2
         with:
-          name: debat-apk
-          path: debat/build/app/outputs/flutter-apk/app-release.apk
+          tag_name: debat-${{ github.run_number }}
+          name: Débat build ${{ github.run_number }}
+          files: debat/build/app/outputs/flutter-apk/app-release.apk
