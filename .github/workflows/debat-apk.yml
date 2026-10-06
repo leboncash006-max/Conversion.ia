@@ -25,6 +25,8 @@ jobs:
           cache: true
       - name: Générer le projet Android
         run: flutter create --platforms=android --org com.debat --project-name debat .
+      - name: Supprimer le test d'exemple généré
+        run: rm -rf test
       - name: Autoriser Internet en release
         run: |
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
